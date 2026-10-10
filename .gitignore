@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+!.env.local.example
+.netlify/
+.DS_Store
+*.log
+*.mov
+*.mp4
+outputs/
