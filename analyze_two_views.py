@@ -14,6 +14,10 @@ Outputs (in outputs/):
       comparison, the same angles measured in 2D in each view.
   <A>+<B>_<limb>_<side>_3d.mp4 - both views side by side: thin grey = MediaPipe in that view alone,
       coloured = the 3D result drawn back into the view.
+  <A>+<B>_<limb>_<side>_switch_events.csv - like extract_kinematics.py's: Switch, Start_ms, Touching_ms,
+      Turn_off_ms (ms of the synced videos). The lights are measured in both views (an event both cameras
+      saw: earliest start, latest turn-off); touching = first frame the hand (foot) is on the switch in BOTH views, or in one view
+      if never both. Switch boxes: the original videos' saved boxes, moved to the synced videos.
 Units: cm with a board calibration (or clicks with --known); otherwise relative (distance between the
 cameras = 1). Angles don't depend on units.
 
@@ -33,6 +37,7 @@ import mediapipe as mp
 from extract_kinematics import (LIMBS, HAND_POINT_NAMES, HAND_CONNECTIONS, SIDE_COLOR, COLOR_LINE,
                                 CameraMotion, draw_limb, default_output_path, open_video_writer)
 from calibrate_cameras import cameras_path, load_cameras, project, triangulate_px
+import extract_kinematics as ek
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
 JOINT_MIN_VIS = 0.2          # a joint is triangulated when both views see it at least this well (low: the
@@ -128,6 +133,143 @@ POSE_INDEX = {'left': {'shoulder': 11, 'elbow': 13, 'wrist': 15, 'hip': 23, 'kne
                         'heel': 30, 'toe': 32}}
 
 
+# -----------------------------
+# Switch events from both views
+# -----------------------------
+def switch_boxes_for(video_path):
+    """Switch boxes (first-frame fractions) for a synced video: saved for it, or the original video's boxes
+    moved to the synced video's first frame, or found now (the user confirms them)."""
+    boxes = ek.load_saved_switches(video_path)
+    if boxes:
+        return boxes
+    synced_first = cv2.VideoCapture(video_path).read()[1]
+    h, w = synced_first.shape[:2]
+    original = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(video_path))),
+                            os.path.basename(video_path).replace('_synced.mp4', '.mov'))
+    orig_boxes = ek.load_saved_switches(original) if os.path.exists(original) else None
+    if orig_boxes:
+        # The synced video starts later than the original: follow the camera movement in between
+        orig_first = cv2.VideoCapture(original).read()[1]
+        camera = ek.CameraMotion(orig_first)
+        camera.update(synced_first)
+        boxes = []
+        for b in orig_boxes:
+            c = camera.apply(ek.box_corners(b, w, h, 0.0))
+            boxes.append([round(float(c[:, 0].min()) / w, 4), round(float(c[:, 1].min()) / h, 4),
+                          round(float(c[:, 0].max()) / w, 4), round(float(c[:, 1].max()) / h, 4)])
+        print(f'  {os.path.basename(video_path)}: switch boxes from {os.path.basename(original)}')
+    else:
+        cap = cv2.VideoCapture(video_path)
+        screen_w, screen_h = ek.get_screen_work_area()
+        display_size = ek.fit_to_screen(w, h, screen_w, screen_h)
+        cv2.namedWindow(ek.WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.resizeWindow(ek.WINDOW_NAME, *display_size)
+        boxes = ek.auto_select_switches(cap, synced_first, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+                                        cap.get(cv2.CAP_PROP_FPS) or 30, display_size)
+        cv2.destroyAllWindows()
+    if boxes:
+        ek.save_switches(video_path, boxes)
+    return boxes
+
+
+def view_switch_signals(video_path, D, boxes, limb, n):
+    """Per switch: light level per frame, and per frame the distance (in box sizes, <= 0 inside) of the
+    closest hand/foot point to the box."""
+    w, h = D['size']
+    light_corners = [ek.box_corners(b, w, h, ek.LIGHT_BOX_MARGIN) for b in boxes]
+    touch_corners = [ek.box_corners(b, w, h, 0.0) for b in boxes]
+    sizes = [float(np.sqrt((b[2] - b[0]) * w * (b[3] - b[1]) * h)) for b in boxes]
+    pose_ids = [i for side in ('left', 'right') for i in limb['touch_points'][side]]
+    light = np.zeros((len(boxes), n))
+    dist = np.full((len(boxes), n), np.inf)
+    cap = cv2.VideoCapture(video_path)
+    for i in range(n):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        M = D['motion'][i]
+        pts = [D['pose'][i, j, :2] for j in pose_ids if D['pose'][i, j, 2] > 0.5]
+        if limb['hand']:
+            for hand in (D['hand_left'][i], D['hand_right'][i]):
+                pts += [p for p in hand if not np.isnan(p[0])]
+        for s in range(len(boxes)):
+            light[s, i] = ek.light_energy(frame, to_frame(light_corners[s], M))
+            poly = to_frame(touch_corners[s], M).astype(np.float32)
+            if pts:
+                dist[s, i] = min(-cv2.pointPolygonTest(poly, (float(x), float(y)), True) for x, y in pts) / sizes[s]
+        if i % 120 == 0:
+            print(f'\r  {os.path.basename(video_path)}: frame {i}/{n}', end='', flush=True)
+    print(f'\r  {os.path.basename(video_path)}: {n} frames      ')
+    return light, dist
+
+
+def merge_events(ev_a, ev_b, fps, max_gap_s=0.2):
+    """Light events of one switch seen by the two cameras -> one list of (on, off) frames (None = unknown).
+    For an event both cameras saw: the earlier start and the later turn-off (a hand over the LED can only
+    make a light look off in one view, never on); an event only one camera saw is kept."""
+    gap = max_gap_s * fps
+    merged, used = [], set()
+    for on_a, off_a in ev_a:
+        match = next((k for k, (on_b, _) in enumerate(ev_b) if k not in used and abs(on_b - on_a) <= gap), None)
+        if match is None:
+            merged.append((on_a, off_a))
+            continue
+        used.add(match)
+        on_b, off_b = ev_b[match]
+        on = min(on_a, on_b) if on_a > 0 and on_b > 0 else max(on_a, on_b)  # 0 = already on at the start
+        off = None if off_a is None or off_b is None else max(off_a, off_b)  # None = still on at the end
+        merged.append((on, off))
+    merged += [e for k, e in enumerate(ev_b) if k not in used]
+    return sorted(merged)
+
+
+def two_view_switch_events(path, args, A, B, limb, n, times, fps):
+    """Switch events (start, touching, turn off) from both cameras -> CSV like extract_kinematics.py's.
+    Touching: each camera's first frame with the hand (foot) on the switch; the later of the two = the moment
+    both cameras have seen it (one view alone can see a hand in front of a switch it doesn't touch yet). If
+    that is after the light went off (pressing turns it off, so the touch can't be later), or only one camera
+    saw a touch, the earliest touch is used."""
+    print('Switch events')
+    boxes = [switch_boxes_for(args.video_a), switch_boxes_for(args.video_b)]
+    if not all(boxes):
+        print('  no switch boxes - skipping switch events')
+        return
+    la, da = view_switch_signals(args.video_a, A, boxes[0], limb, n)
+    lb, db = view_switch_signals(args.video_b, B, boxes[1], limb, n)
+    touch_window = int(round(ek.TOUCH_AFTER_OFF_S * fps))
+    rows, both_count, one_count = [], 0, 0
+    for s in range(ek.N_SWITCHES):
+        ev_a, why_a = ek.find_light_events(la[s], fps)
+        ev_b, why_b = ek.find_light_events(lb[s], fps)
+        events = merge_events(ev_a, ev_b, fps)
+        if not events:
+            print(f'  switch {s + 1}: no light events (A: {why_a}; B: {why_b})')
+            rows.append([s + 1, '', '', ''])
+            continue
+        print(f'  switch {s + 1}: {len(events)} light event(s) (camera A saw {len(ev_a)}, B saw {len(ev_b)})')
+        for k, (on, off) in enumerate(events):
+            end = n if off is None else min(n, off + touch_window)
+            if k + 1 < len(events):
+                end = min(end, events[k + 1][0])
+            firsts = [on + int(np.argmax(d[s, on:end] <= ek.TOUCH_DIST))
+                      for d in (da, db) if (d[s, on:end] <= ek.TOUCH_DIST).any()]
+            touch = None
+            if len(firsts) == 2 and (off is None or max(firsts) <= off + 1):
+                touch, both_count = max(firsts), both_count + 1
+            elif firsts:
+                touch, one_count = min(firsts), one_count + 1
+            rows.append([s + 1, round(float(times[on]), 1) if on > 0 else '',
+                         round(float(times[touch]), 1) if touch is not None else '',
+                         round(float(times[off]), 1) if off is not None else ''])
+    rows.sort(key=lambda r: (r[0], r[1] if r[1] != '' else -1))
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['Switch', 'Start_ms', 'Touching_ms', 'Turn_off_ms'])
+        w.writerows(rows)
+    print(f'  touches confirmed by both cameras: {both_count}, from one camera: {one_count}')
+    print(f'Switch events saved to {path}')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Track one limb in 3D from two synchronised videos.')
     parser.add_argument('video_a')
@@ -135,6 +277,7 @@ def main():
     parser.add_argument('--limb', choices=['upper', 'lower'], required=True)
     parser.add_argument('--side', choices=['left', 'right'], required=True, help="The subject's own side")
     parser.add_argument('--cameras', help='Camera file from calibrate_cameras.py (default: the one for these videos)')
+    parser.add_argument('--no-switches', action='store_true', help='Skip the switch events')
     args = parser.parse_args()
 
     limb = LIMBS[args.limb]
@@ -302,7 +445,12 @@ def main():
             print(f'\r  frame {i}/{n}', end='', flush=True)
     writer.release()
     print(f'\r  {n} frames      ')
-    print('Saved:', csv_path, video_path, sep='\n  ')
+    saved = [csv_path, video_path]
+    if not args.no_switches:
+        events_path = default_output_path(tag, 'switch_events', '.csv')
+        two_view_switch_events(events_path, args, A, B, limb, n, times, fps)
+        saved.append(events_path)
+    print('Saved:', *saved, sep='\n  ')
 
 
 if __name__ == '__main__':
