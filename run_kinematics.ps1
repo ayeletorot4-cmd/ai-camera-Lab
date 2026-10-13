@@ -45,10 +45,10 @@ if ($answer -match '^[Yy]') {
         try { $hasSwitches = $null -ne (Get-Content $switchFile -Raw | ConvertFrom-Json).$videoName } catch {}
     }
     if ($hasSwitches) {
-        $answer = Read-Host "Switch positions are saved for $videoName. Press ENTER to reuse them, or type R to mark them again"
+        $answer = Read-Host "Switch positions are saved for $videoName. Press ENTER to reuse them, or type R to find them again"
         if ($answer -match '^[Rr]') { $extraArgs += '--select-switches' }
     } else {
-        Write-Host 'In the video window: drag a box around each switch in order 1 to 5 (RIGHT to LEFT), pressing ENTER after each.'
+        Write-Host 'The switches will be found automatically (about a minute), then shown numbered 1 to 5 (RIGHT to LEFT): press ENTER if correct, or follow the keys shown to fix them.'
     }
 }
 

@@ -1,0 +1,5 @@
+# MediaPipe 0.10.21 is the last version with the mp.solutions API this script uses; it needs Python 3.9-3.12.
+mediapipe==0.10.21
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4
+scipy  # two-camera scripts (sync_videos.py, calibrate_cameras.py)

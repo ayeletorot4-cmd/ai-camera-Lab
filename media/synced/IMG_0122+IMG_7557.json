@@ -1,0 +1,13 @@
+{
+  "video_a": "IMG_0122.mov",
+  "video_b": "IMG_7557.mov",
+  "offset_s": 1.8383,
+  "fps": 60.0,
+  "frames": 1638,
+  "start_in_a_s": 1.835,
+  "start_in_b_s": -0.0017,
+  "outputs": [
+    "IMG_0122_synced.mp4",
+    "IMG_7557_synced.mp4"
+  ]
+}

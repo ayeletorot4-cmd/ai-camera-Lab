@@ -2,7 +2,7 @@
 
 The whole frame is analyzed, but only the chosen limb is saved and drawn:
   upper limb - shoulder, elbow, wrist + the 21 hand/finger points (red cross = hand-model wrist)
-  lower limb - hip, knee, ankle, heel, toe
+  lower limb - hip, knee, ankle, heel, toe (red cross = ankle)
 Outputs (in outputs/): a CSV of the limb's points and a video of the full original frame with the limb skeleton.
 With --switches: also a CSV of light/touch events for the 5 switches (boxes with lights) on the table.
 """
@@ -13,6 +13,7 @@ import csv
 import sys
 import os
 import ctypes
+import subprocess
 import argparse
 import json
 from datetime import datetime
@@ -43,13 +44,25 @@ LIMBS = {
 HAND_POINT_NAMES = [lm.name.lower() for lm in mp.solutions.hands.HandLandmark]  # wrist, thumb_cmc, ...
 HAND_CONNECTIONS = mp.solutions.hands.HAND_CONNECTIONS
 
-# Drawing colours (BGR): subject's left = orange, right = cyan; red cross on the hand-model wrist
+# Drawing colours (BGR): subject's left = orange, right = cyan; red cross on the hand-model wrist / ankle
 SIDE_COLOR = {'left': (0, 138, 255), 'right': (231, 217, 0)}
 COLOR_LINE, COLOR_CROSS = (255, 255, 255), (0, 0, 255)
 
 
 def get_screen_work_area():
-    """Usable screen size in real pixels (excludes the taskbar), DPI-scaling aware."""
+    """Usable screen size in real pixels (excludes the taskbar), DPI-scaling aware.
+
+    On macOS: the main screen without the menu bar and Dock, in points (the unit OpenCV windows use there)."""
+    if sys.platform == 'darwin':
+        try:
+            out = subprocess.run(
+                ['osascript', '-l', 'JavaScript', '-e',
+                 'ObjC.import("AppKit"); var f = $.NSScreen.mainScreen.visibleFrame; '
+                 'f.size.width + " " + f.size.height'],
+                capture_output=True, text=True, timeout=5).stdout.split()
+            return int(float(out[0])), int(float(out[1]))
+        except Exception:
+            return 1280, 720
     try:
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor DPI aware
@@ -63,13 +76,22 @@ def get_screen_work_area():
         ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)  # SPI_GETWORKAREA
         return r.right - r.left, r.bottom - r.top
     except Exception:
-        return 1280, 720  # safe fallback (non-Windows)
+        return 1280, 720  # safe fallback (other systems)
 
 
 def fit_to_screen(frame_w, frame_h, screen_w, screen_h, margin=0.9):
     """Largest size that keeps the aspect ratio and fits inside the screen (leaves room for the title bar)."""
     scale = min(screen_w * margin / frame_w, (screen_h - 40) * margin / frame_h, 1.0)
     return int(frame_w * scale), int(frame_h * scale)
+
+
+def open_video_writer(path, fps, size):
+    """MP4 writer: H.264 (plays everywhere, also in browsers) if this OpenCV build has it, else MPEG-4 Part 2."""
+    for fourcc in ('avc1', 'mp4v'):
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, size)
+        if writer.isOpened():
+            return writer
+    return writer
 
 
 def default_output_path(video_path, suffix, ext):
@@ -86,7 +108,8 @@ def default_output_path(video_path, suffix, ext):
 # -----------------------------
 # Switch events
 # -----------------------------
-# The switch boxes are marked once on the first frame (saved per video and offered again next time).
+# The switch boxes are found automatically (or marked by hand) once on the first frame, saved per video
+# and offered again next time.
 # Each box follows small camera movements, its red light is measured every frame, and touching =
 # a point of the tracked hand (or foot) inside the box.
 SWITCH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs', 'switch_settings.json')
@@ -153,6 +176,229 @@ def select_switches(first_frame, display_size):
         boxes.append([round(x / dw, 4), round(y / dh, 4), round((x + w) / dw, 4), round((y + h) / dh, 4)])
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 0)
     return boxes
+
+
+# -----------------------------
+# Automatic switch finding
+# -----------------------------
+# A switch = black housing (white label on top) + red mushroom button, and its pink LED lights up during
+# the video. One pass over the video (about as long as decoding it) builds a background image (median of
+# frames aligned to the first one, so the subject mostly disappears) and a map of where pink light appeared.
+SCAN_SCALE = 0.5            # the scan works on a half-size copy
+SCAN_PER_S = 4              # frames per second checked for pink light
+SCAN_BACKGROUND_FRAMES = 20  # frames in the median background
+SWITCH_BOX_PAD = 0.1        # found boxes are enlarged by 10% of their size on each side
+
+
+def _disk(d):
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+
+
+def _fill_holes(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+    cv2.drawContours(out, contours, -1, 1, -1)
+    return out
+
+
+def pink_mask(frame):
+    """Pixels lit by a switch's pink LED (same colour test as light_energy)."""
+    p = frame.astype(np.int16)
+    B, G, R = p[..., 0], p[..., 1], p[..., 2]
+    return (R > 200) & (G > 90) & (B >= G - 15) & (R - np.maximum(G, B) > 20)
+
+
+def scan_video(cap, first_frame, total_frames, fps, show):
+    """(background image, fraction of checked frames each pixel was pink), both half size, first-frame coords."""
+    camera = CameraMotion(first_frame)
+    h, w = first_frame.shape[:2]
+    sw, sh = int(w * SCAN_SCALE), int(h * SCAN_SCALE)
+    step = max(1, int(round(fps / SCAN_PER_S)))
+    bg_every = max(1, total_frames // (step * SCAN_BACKGROUND_FRAMES))
+    pink_count = np.zeros((sh, sw), np.float32)
+    background, checked = [], 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    i = 0
+    while cap.grab():
+        if i % step == 0:
+            ok, frame = cap.retrieve()
+            if not ok:
+                break
+            camera.update(frame)
+            M = cv2.invertAffineTransform(camera.M)  # current frame -> first frame
+            M[:, 2] *= SCAN_SCALE
+            small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+            aligned = cv2.warpAffine(small, M, (sw, sh), borderMode=cv2.BORDER_REPLICATE)
+            pink_count += pink_mask(aligned)
+            if checked % bg_every == 0:
+                background.append(aligned)
+            checked += 1
+            if checked % 20 == 0:
+                show(i / max(1, total_frames))
+        i += 1
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return np.median(np.stack(background), axis=0).astype(np.uint8), pink_count / max(1, checked)
+
+
+def switch_candidates(img, size=1.0):
+    """Boxes (pixels) of black housings with a red button and a white label. `size` scales the
+    clean-up kernels: 1.0 for near switches, 0.5 for small far-away ones."""
+    k = lambda d: max(3, int(d * size) | 1)
+    H, S, V = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
+    red = (((H < 8) | (H > 170)) & (S > 130) & (V > 70)).astype(np.uint8)
+    white = (V > 150) & (S < 70)
+    dark = cv2.morphologyEx((V < 70).astype(np.uint8), cv2.MORPH_OPEN, _disk(k(11)))  # drops cables
+    # Housing + button as one blob (the button splits the housing's dark front face), label holes filled
+    body = _fill_holes(cv2.morphologyEx(dark | red, cv2.MORPH_CLOSE, _disk(k(9))))
+    # Shrink, split, grow back: separates switches that touch in the image
+    n, labels, _, _ = cv2.connectedComponentsWithStats(cv2.erode(body, _disk(k(21))))
+    out = []
+    for i in range(1, n):
+        region = cv2.dilate((labels == i).astype(np.uint8), _disk(k(21))) & body
+        area = int(region.sum())
+        x, y, w, h = cv2.boundingRect(region)
+        if area < 150 * size * size or area > 0.02 * img.shape[0] * img.shape[1]:
+            continue
+        if area / (w * h) < 0.45 or max(w, h) / min(w, h) > 3:  # compact, box-like
+            continue
+        inside = region > 0
+        if not 0.015 <= red[inside].mean() <= 0.5 or dark[inside].mean() < 0.4:
+            continue
+        if white[max(0, y - h // 2):y + h, x:x + w].mean() < 0.01:  # label (on top, may be above the front)
+            continue
+        out.append((x, y, x + w, y + h))
+    return out
+
+
+def _overlap(a, b):
+    """Intersection area / area of the smaller box."""
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    return ix * iy / max(1, min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1])))
+
+
+def order_switches(centers):
+    """Indices of the switches from the subject's RIGHT to LEFT.
+
+    The switches stand in an arc around the subject: follow the arc from one end to the other, then
+    pick the direction from the way the arc bulges (the subject faces it; camera looking down)."""
+    c = np.asarray(centers, float)
+    n = len(c)
+    if n < 2:
+        return list(range(n))
+    d = np.linalg.norm(c[:, None] - c[None], axis=2)
+    a, b = np.unravel_index(np.argmax(d), d.shape)  # the two ends of the arc
+    chain, rest = [int(a)], set(range(n)) - {int(a)}
+    while rest:
+        nxt = min(rest, key=lambda j: d[chain[-1], j])
+        chain.append(nxt)
+        rest.remove(nxt)
+    if n >= 3:
+        facing = c[chain[1:-1]].mean(axis=0) - (c[a] + c[b]) / 2
+        right = np.array([-facing[1], facing[0]])  # image y points down
+        if np.dot(c[chain[-1]] - c[chain[0]], right) > 0:
+            chain.reverse()
+    return chain
+
+
+def find_switches(background, pink_frac):
+    """Up to 5 switch boxes as [x0, y0, x1, y1] fractions, numbered from the subject's right to left."""
+    h, w = background.shape[:2]
+    boxes = switch_candidates(background, 1.0) + switch_candidates(background, 0.5)
+
+    def light(box):  # share of the area around the switch where its pink LED/glow appeared
+        x0, y0, x1, y1 = box
+        bw, bh = x1 - x0, y1 - y0
+        return float((pink_frac[max(0, y0 - bh):y1 + bh, max(0, x0 - bw):x1 + bw] > 0.02).mean())
+
+    kept = []
+    for box in sorted(boxes, key=light, reverse=True):
+        if light(box) > 0.005 and all(_overlap(box, k) <= 0.3 for k in kept):
+            kept.append(box)
+    kept = kept[:N_SWITCHES]
+    fracs = []
+    for x0, y0, x1, y1 in kept:
+        px, py = (x1 - x0) * SWITCH_BOX_PAD, (y1 - y0) * SWITCH_BOX_PAD
+        fracs.append([round(max(0, x0 - px) / w, 4), round(max(0, y0 - py) / h, 4),
+                      round(min(w, x1 + px) / w, 4), round(min(h, y1 + py) / h, 4)])
+    return sort_switches(fracs)
+
+
+def sort_switches(boxes, flip=False):
+    order = order_switches([((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes])
+    boxes = [boxes[i] for i in order]
+    return boxes[::-1] if flip else boxes
+
+
+def draw_text_lines(img, lines, scale=0.8):
+    for i, line in enumerate(lines):
+        y = int(35 * scale / 0.8) + int(32 * scale / 0.8) * i
+        cv2.putText(img, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 5)
+        cv2.putText(img, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 255), 2)
+
+
+def confirm_switches(first_frame, boxes, display_size):
+    """Show the found switches; the user accepts, flips the numbering or fixes boxes.
+    Returns the final boxes, or None to go on without switch events."""
+    dw, dh = display_size
+    flip = False
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
+    while True:
+        shown = cv2.resize(first_frame, display_size, interpolation=cv2.INTER_AREA)
+        for k, (x0, y0, x1, y1) in enumerate(boxes):
+            p0, p1 = (int(x0 * dw), int(y0 * dh)), (int(x1 * dw), int(y1 * dh))
+            cv2.rectangle(shown, p0, p1, (0, 255, 255), 2)
+            cv2.putText(shown, str(k + 1), (p0[0], p0[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 5)
+            cv2.putText(shown, str(k + 1), (p0[0], p0[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+        lines = [f"Found {len(boxes)} of {N_SWITCHES} switches, numbered from the subject's RIGHT to LEFT."]
+        if len(boxes) == N_SWITCHES:
+            lines.append("ENTER = OK    F = flip the numbering")
+        else:
+            lines.append("A = add a missing switch")
+        lines += ["1-5 = redraw that switch's box    M = mark all by hand    C = cancel switch events"]
+        draw_text_lines(shown, lines)
+        cv2.imshow(WINDOW_NAME, shown)
+        key = cv2.waitKey(0) & 0xFF
+        if key in (13, 10) and len(boxes) == N_SWITCHES:
+            break
+        if key in (ord('f'), ord('F')):
+            boxes, flip = boxes[::-1], not flip
+        elif key in (ord('c'), ord('C')):
+            boxes = None
+            break
+        elif key in (ord('m'), ord('M')):
+            boxes = select_switches(first_frame, display_size)
+            break
+        elif (key in (ord('a'), ord('A')) and len(boxes) < N_SWITCHES) or \
+                (ord('1') <= key < ord('1') + len(boxes)):
+            redo = key - ord('1') if ord('1') <= key <= ord('9') else None
+            draw_text_lines(shown, ["", "", "", "Drag the box, then press ENTER (C = back)."])
+            x, y, w, h = cv2.selectROI(WINDOW_NAME, shown, showCrosshair=False)
+            if w >= 5 and h >= 5:
+                box = [round(x / dw, 4), round(y / dh, 4), round((x + w) / dw, 4), round((y + h) / dh, 4)]
+                if redo is None:
+                    boxes = sort_switches(boxes + [box], flip)
+                else:
+                    boxes[redo] = box
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 0)
+    return boxes
+
+
+def auto_select_switches(cap, first_frame, total_frames, fps, display_size):
+    """Find the switches automatically, then let the user confirm or fix them."""
+    def show(progress):
+        shown = cv2.resize(first_frame, display_size, interpolation=cv2.INTER_AREA)
+        draw_text_lines(shown, [f"Finding the switches... {progress:.0%}",
+                                "(one pass over the video; positions are saved for next time)"])
+        cv2.imshow(WINDOW_NAME, shown)
+        cv2.waitKey(1)
+
+    print("Finding the switches (one pass over the video)...")
+    show(0)
+    background, pink_frac = scan_video(cap, first_frame, total_frames, fps, show)
+    boxes = find_switches(background, pink_frac)
+    print(f"  found {len(boxes)} of {N_SWITCHES}")
+    return confirm_switches(first_frame, boxes, display_size)
 
 
 def box_corners(box, frame_w, frame_h, margin):
@@ -277,7 +523,7 @@ def find_light_events(signal, fps):
 
 
 def draw_limb(image, joints_px, segments, hand_px, color, scale):
-    """Draw the limb's segments and joints, the fingers, and a red cross on the hand-model wrist."""
+    """Draw the limb's segments and joints, the fingers, and a red cross on the hand-model wrist (or the ankle)."""
     line_t = max(2, int(3 * scale))
     radius = max(4, int(8 * scale))
     for a, b in segments:
@@ -292,7 +538,9 @@ def draw_limb(image, joints_px, segments, hand_px, color, scale):
             cv2.line(image, hand_px[a], hand_px[b], COLOR_LINE, finger_t, cv2.LINE_AA)
         for p in hand_px[1:]:
             cv2.circle(image, p, max(2, int(4 * scale)), color, -1, cv2.LINE_AA)
-        cv2.drawMarker(image, hand_px[0], COLOR_CROSS, cv2.MARKER_CROSS,
+    cross_px = hand_px[0] if hand_px else joints_px.get('ankle')
+    if cross_px:
+        cv2.drawMarker(image, cross_px, COLOR_CROSS, cv2.MARKER_CROSS,
                        max(12, int(18 * scale)), max(2, int(3 * scale)), cv2.LINE_AA)
 
 
@@ -309,7 +557,7 @@ def main():
     parser.add_argument('--switches', action='store_true',
                         help='Also detect light start / touching / light off events for the 5 switches')
     parser.add_argument('--select-switches', action='store_true',
-                        help='Mark the switches again even if they are saved for this video')
+                        help='Find/mark the switches again even if they are saved for this video')
     args = parser.parse_args()
 
     limb = LIMBS[args.limb]
@@ -357,8 +605,7 @@ def main():
 
     # Output video: the whole original frame (full resolution) with the limb skeleton
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    video_writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'mp4v'),
-                                   fps, (frame_w, frame_h))
+    video_writer = open_video_writer(output_video_path, fps, (frame_w, frame_h))
     if not video_writer.isOpened():
         print(f"Error: Could not create output video {output_video_path}")
         sys.exit(1)
@@ -368,7 +615,7 @@ def main():
     text_scale = max(1.0, draw_scale * 0.8)
     text_t = max(2, int(2 * draw_scale))
 
-    # Switches: saved boxes for this video, or mark them on the first frame
+    # Switches: saved boxes for this video, or find them automatically (the user confirms or fixes them)
     switch_boxes = None
     if args.switches or args.select_switches:
         ret, first_frame = cap.read()
@@ -378,7 +625,7 @@ def main():
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         switch_boxes = None if args.select_switches else load_saved_switches(input_video_path)
         if switch_boxes is None:
-            switch_boxes = select_switches(first_frame, display_size)
+            switch_boxes = auto_select_switches(cap, first_frame, total_frames, fps, display_size)
             if switch_boxes:
                 save_switches(input_video_path, switch_boxes)
             else:
@@ -403,7 +650,7 @@ def main():
     print(f"        {output_video_path}")
     if switch_boxes:
         print(f"        {events_csv_path}")
-    print("Press 'q' in the video window to stop early.")
+    print("Press Esc in the video window (or close it) to stop early.")
 
     frame_idx = 0
     hand_found = 0
@@ -529,8 +776,10 @@ def main():
                 if frame_idx % 30 == 0 or frame_idx == total_frames:
                     print(f"\r  frame {frame_idx}/{total_frames}", end='', flush=True)
 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print("\n  Stopped early by user.")
+                # Esc, not a letter: the preview comes to the front and takes the keyboard, so typing in
+                # another window (e.g. a chat message with a 'q') must not stop the run
+                if cv2.waitKey(1) & 0xFF == 27:
+                    print("\n  Stopped early by user (Esc).")
                     break
                 # Closing the window with the X button also stops processing
                 if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
