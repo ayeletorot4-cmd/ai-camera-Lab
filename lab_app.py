@@ -26,7 +26,7 @@ import video_source as vs  # noqa: E402
 
 PART_CHOICES = [ed.IGNORE] + ed.PART_ORDER
 FLAG_COLOR = {'miss': '#f8d7da', 'not detected': '#e2e3e5', 'unknown': '#e2e3e5',
-              'anticipation': '#fff3cd', 'corrected': '#d1ecf1'}
+              'anticipation': '#fff3cd', 'corrected': '#d1ecf1', 'shortcut': '#e8daef'}
 
 
 # -----------------------------
@@ -912,8 +912,8 @@ class LabApp(QtWidgets.QMainWindow):
         flt.addWidget(self.k_flagged)
         flt.addStretch()
         left.addLayout(flt)
-        cols = ['Part', 'Blk', 'Seq', 'Trial', 'Target', 'Outcome', 'Light', 'Anticip.', 'Corrected', 'RT (s)', 'MT (s)',
-                'Data', 'touse']
+        cols = ['Part', 'Blk', 'Seq', 'Trial', 'Target', 'Outcome', 'Light', 'Anticip.', 'Start', 'Corrected',
+                'RT (s)', 'MT (s)', 'Data', 'touse']
         self.t_trials = QtWidgets.QTableWidget(0, len(cols))
         self.t_trials.setHorizontalHeaderLabels(cols)
         self.t_trials.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -925,7 +925,8 @@ class LabApp(QtWidgets.QMainWindow):
         left.addWidget(self.t_trials, 1)
         self.l_legend = QtWidgets.QLabel(
             '<span style="background:#f8d7da">&nbsp;miss&nbsp;</span> '
-            '<span style="background:#fff3cd">&nbsp;started before the light&nbsp;</span> '
+            '<span style="background:#fff3cd">&nbsp;started before the light (negative RT)&nbsp;</span> '
+            '<span style="background:#e8daef">&nbsp;not from home (shortcut)&nbsp;</span> '
             '<span style="background:#d1ecf1">&nbsp;corrected (went to another switch first)&nbsp;</span> '
             '<span style="background:#e2e3e5">&nbsp;light not detected&nbsp;</span> - untick touse to leave a '
             'trial out of the summaries')
@@ -997,7 +998,8 @@ class LabApp(QtWidgets.QMainWindow):
                 if (p is None or r['Part'] == p) and (b is None or str(r['Block']) == b)
                 and (s is None or str(r['Sequence']) == s)]
         if self.k_flagged.isChecked():
-            rows = [r for r in rows if r['Outcome'] != 'hit' or r['anticipation'] or r['corrected_from']]
+            rows = [r for r in rows if r['Outcome'] != 'hit' or r['anticipation'] or r['corrected_from']
+                    or r.get('start_from') not in ('', 'home', None)]
         self.shown_rows = rows
         t = self.t_trials
         t.blockSignals(True)
@@ -1006,9 +1008,12 @@ class LabApp(QtWidgets.QMainWindow):
             vals = [r['Part'], r['Block'], r['Sequence'], r['Trial'], r['Target'], r['Outcome'],
                     r.get('Light_source', ''),
                     f"yes ({r['anticipation_ms']:.0f} ms)" if r['anticipation'] else '',
+                    r.get('start_from', '') if r.get('start_from') != 'home' else 'home',
                     f"from {r['corrected_from']}" if r['corrected_from'] else '',
                     fmt(r['responsetime']), fmt(r['movementtime']), r.get('Data', '')]
-            color = (FLAG_COLOR.get(r['Outcome']) or (FLAG_COLOR['anticipation'] if r['anticipation'] else None)
+            shortcut = r.get('start_from') not in ('', 'home', None)
+            color = (FLAG_COLOR.get(r['Outcome']) or (FLAG_COLOR['shortcut'] if shortcut else None)
+                     or (FLAG_COLOR['anticipation'] if r['anticipation'] else None)
                      or (FLAG_COLOR['corrected'] if r['corrected_from'] else None))
             for c, val in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(str(val))
