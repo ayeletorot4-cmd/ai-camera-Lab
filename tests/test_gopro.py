@@ -301,5 +301,30 @@ class BoardCalibrationWithOffset(unittest.TestCase):
             pass
 
 
+class OffsetEverywhere(unittest.TestCase):
+    def test_light_events_from_b_use_the_offset(self):
+        """A light camera B sees at its own time t ends up at t + offset_s on the session clock."""
+        import session_analysis as sa
+        import experiment_design as ed
+        fps, offset = 60.0, 5.0
+        n_a, n_b = 20 * 60, 30 * 60
+        s = sa.Session.__new__(sa.Session)
+        s.state = {'offset_s': offset}
+        light_b = np.zeros((5, n_b), np.float32)
+        light_b[2, 600:630] = 50.0            # switch 3 lit at B's 10.0-10.5 s
+        light_b[2, 1500:1530] = 50.0          # and at B's 25 s = session 30 s (after A stopped at 20 s)
+        for k in range(8):                    # a few more so the light test has on/off contrast
+            light_b[0, 900 + k * 90:900 + k * 90 + 20] = 50.0
+        s.cams = {'a': {'times': np.arange(n_a) * 1000 / fps, 'meta': {'fps': fps}},
+                  'b': {'times': np.arange(n_b) * 1000 / fps, 'meta': {'fps': fps}, 'light': light_b}}
+        s.A, s.B = s.cams['a'], s.cams['b']
+        s._timeline()
+        ev = [(sw, s.to_master('b', on), s.to_master('b', off)) for sw, on, off in ed.light_events(light_b, fps)
+              if sw == 3]
+        self.assertEqual(len(ev), 2)
+        self.assertAlmostEqual(s.times[ev[0][1]], 15000, delta=1000 / fps)   # 10 s on B = 15 s on A's clock
+        self.assertAlmostEqual(s.times[ev[1][1]], 30000, delta=1000 / fps)   # beyond A's end: still placed right
+
+
 if __name__ == '__main__':
     unittest.main()
