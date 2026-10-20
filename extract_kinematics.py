@@ -208,18 +208,20 @@ def pink_mask(frame):
     return (R > 200) & (G > 90) & (B >= G - 15) & (R - np.maximum(G, B) > 20)
 
 
-def scan_video(cap, first_frame, total_frames, fps, show):
-    """(background image, fraction of checked frames each pixel was pink), both half size, first-frame coords."""
+def scan_video(cap, first_frame, total_frames, fps, show, start_frame=0, max_frames=None, should_stop=None):
+    """(background image, fraction of checked frames each pixel was pink), both half size, first-frame coords.
+    start_frame / max_frames: only scan that part of the video (a long session: a few minutes with lights)."""
     camera = CameraMotion(first_frame)
     h, w = first_frame.shape[:2]
     sw, sh = int(w * SCAN_SCALE), int(h * SCAN_SCALE)
     step = max(1, int(round(fps / SCAN_PER_S)))
-    bg_every = max(1, total_frames // (step * SCAN_BACKGROUND_FRAMES))
+    span = min(total_frames - start_frame, max_frames or total_frames)
+    bg_every = max(1, span // (step * SCAN_BACKGROUND_FRAMES))
     pink_count = np.zeros((sh, sw), np.float32)
     background, checked = [], 0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     i = 0
-    while cap.grab():
+    while i < span and cap.grab():
         if i % step == 0:
             ok, frame = cap.retrieve()
             if not ok:
@@ -234,7 +236,9 @@ def scan_video(cap, first_frame, total_frames, fps, show):
                 background.append(aligned)
             checked += 1
             if checked % 20 == 0:
-                show(i / max(1, total_frames))
+                show(i / max(1, span))
+                if should_stop and should_stop():
+                    break
         i += 1
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     return np.median(np.stack(background), axis=0).astype(np.uint8), pink_count / max(1, checked)

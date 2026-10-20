@@ -12,3 +12,4 @@ __pycache__/
 *.mp4
 outputs/
 venv/
+results/
