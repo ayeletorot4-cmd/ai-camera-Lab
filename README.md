@@ -71,18 +71,37 @@ A window app for whole experiment sessions: double-click **`Lab App.command`** (
 
 `results/` holds participant data and is not uploaded to git.
 
+## Two GoPro cameras (recommended setup)
+**Camera settings** - the same on both cameras: GoPro HERO13 Black, **4K, 60 fps, lens Linear, HyperSmooth (stabilization) OFF**, on fixed mounts (don't move them during the day - then one calibration serves every recording of that day).
+
+**The board** - `venv/bin/python calibrate_cameras.py make-board` writes `outputs/charuco_board.pdf` (exact A4 scale) and `charuco_board.png`: a ChArUco board of 5 x 7 squares, 38 mm, `DICT_4X4_50` markers. Print the PDF **at 100% / Actual size** (not "fit to page"), check the 100 mm bar and one square with a ruler (38 mm; note the measured size), and glue it to something flat and stiff.
+
+**Each session:**
+1. **Sync the timecode**: in the GoPro Quik app, *Sync Timecode* (both cameras scan the QR code). Then each camera can start / stop on its own - the timecode tells how the files line up.
+2. **Record**: start both cameras; hold the board where both see it and slowly tilt / turn / move it around the subject's area for ~20-30 s; then run the experiment.
+3. **App → Session**: choose each camera's video - the **first chapter** (`GX01xxxx.MP4`). GoPro splits long recordings into ~4 GB chapters (`GX010123.MP4`, `GX020123.MP4`, ...); the following chapters of the same clip are found automatically and used as one continuous video (the app shows them and warns if they don't follow each other).
+4. **Offset**: filled in automatically from the start timecodes (*From timecode*), and checked against the sound (warning if they differ by more than one frame). Offset = seconds into video A at which video B started.
+5. **Board calibration…**: source = the session videos (time window; default the first 60 s) or separate calibration clips; enter the measured square size. It shows the frames with the board in A / B / both, each lens' fit error, the stereo fit error, the distance between the cameras and a check (the board's squares measured from the 3D result vs the entered size, and the reprojection error) - **PASS** or warnings (e.g. fewer than 20 frames seen by both, stereo error > 1 px). The result is saved with the session and used as its calibration. *Use an earlier calibration…* re-uses the file of an earlier recording of the same day (cameras not moved).
+6. **Switches → Process → Blocks & parts → Trials → Export** as before.
+
+The timecode is read with `ffprobe` (FFmpeg) if installed - on a Mac `brew install ffmpeg` (Homebrew: https://brew.sh); on Windows from https://ffmpeg.org/download.html, added to PATH - otherwise straight from the MP4's timecode track (no FFmpeg needed). Timecodes HH:MM:SS:FF and drop-frame HH:MM:SS;FF are converted with the file's real frame rate (e.g. 59.94).
+
+Command line: `venv/bin/python calibrate_cameras.py board GX010123.MP4 GX010456.MP4 [--offset S] [--start S] [--seconds 60] [--square-mm 38]` (offset from the timecodes if not given).
+
+**Tests**: `venv/bin/python -m unittest discover -s tests -v` (timecodes incl. drop-frame and 59.94, the offset's sign, chapters, pairing of board frames with an offset, the printed board).
+
 ## Two cameras (3D)
 Two cameras filming the same session from different angles give each joint's position in 3D, which fixes what one camera can't see (depth, a joint hidden behind the body, angles distorted by perspective). Three steps, on a Mac, from this folder:
 
-**1. Sync the videos** (not needed for cameras that record a shared timecode, e.g. synced GoPros):
+**1. Sync the videos** (not needed for timecode-synced GoPros: the app takes the offset from the timecodes - see above):
 ```
 venv/bin/python sync_videos.py media/IMG_0122.mov media/IMG_7557.mov
 ```
 Finds the time offset from the sound and writes both videos cut to the common part, frame-by-frame in sync (to within half a frame), to `media/synced/` (`<video>_synced.mp4` + a .json with the offset). If the sound match is unclear, give the offset yourself: `--offset 1.838` (seconds into video A at which video B started). Already done for IMG_0122+IMG_7557 (offset 1.838 s) and IMG_0123+IMG_7558 (0.648 s); both offsets were checked against the switch lights seen by both cameras (agree within 1 ms).
 
 **2. Calibrate the cameras** (where camera B is relative to camera A, and their lenses) - one of:
-- **Printed board** (best; for a fixed setup): print `outputs/charuco_board.png` on A4 at 100% (each square 38 mm - measure it), glue it to something flat. At the start of the session, with both cameras recording, hold it where both cameras see it and slowly tilt/turn/move it around the subject's area for ~20 s. Then
-  `venv/bin/python calibrate_cameras.py board VIDEO_A VIDEO_B [--square-mm 38]` - gives real units (cm) and each lens' distortion. Cameras on fixed mounts: one calibration serves the whole session. GoPro: use the "Linear" lens setting. (`calibrate_cameras.py make-board` makes the board image again.)
+- **Printed board** (best; for a fixed setup - in the app: *Board calibration…*): print `outputs/charuco_board.pdf` on A4 at 100% (each square 38 mm - measure it), glue it to something flat. At the start of the session, with both cameras recording, hold it where both cameras see it and slowly tilt/turn/move it around the subject's area for ~20 s. Then
+  `venv/bin/python calibrate_cameras.py board VIDEO_A VIDEO_B [--square-mm 38] [--offset S]` (frames of the two videos are paired by time with the offset) - gives real units (cm) and each lens' distortion. Cameras on fixed mounts: one calibration serves the whole session. GoPro: use the "Linear" lens setting. (`calibrate_cameras.py make-board` makes the board image again.)
 - **Clicks** (existing videos without a board):
   `venv/bin/python calibrate_cameras.py clicks media/synced/IMG_0122_synced.mp4 media/synced/IMG_7557_synced.mp4`
   Both first frames open side by side; click the same point in A (left), then in B (right), at least 8 times (more is better; 20+ also corrects the lens focal length). Use the magnifier. Good points: the centres of the red switch buttons, corners of the white labels, table corners, and the subject in that first frame (knuckle, ring, elbow tip) - points that are not all on the table top. U = undo, ENTER = done. The clicks are saved (`--again` to redo). Add `--known 1 3 45.5` if you know the real distance between two clicked points (here points 1 and 3, 45.5 cm) to get cm.
