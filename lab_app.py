@@ -535,13 +535,27 @@ class LabApp(QtWidgets.QMainWindow):
     def open_session(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Session folder (results/<subject>/<session>)',
                                                             sa.RESULTS_DIR)
-        if folder and os.path.exists(os.path.join(folder, 'session.json')):
-            self.state = sa.load_state(folder)
-            self.state_to_form()
-            self.session = None
-            self.info(f'Opened {folder}')
-        elif folder:
-            self.error('That folder has no session.json.')
+        if not folder:
+            return
+        # Also accept the subject folder (results/<subject>) or results/: offer the sessions found below it
+        found = sorted(os.path.dirname(os.path.join(r, f)) for r, _, fs in os.walk(folder) for f in fs
+                       if f == 'session.json' and os.path.relpath(r, folder).count(os.sep) < 2)
+        if not found:
+            self.error(f'No saved session in {folder} - a session is the folder results/<subject>/<session> '
+                       '(e.g. results/S01/d1).')
+            return
+        if len(found) > 1:
+            names = [os.path.relpath(p, sa.RESULTS_DIR) if p.startswith(sa.RESULTS_DIR) else p for p in found]
+            name, ok = QtWidgets.QInputDialog.getItem(self, 'Open a session', 'Sessions in that folder:', names, 0, False)
+            if not ok:
+                return
+            folder = found[names.index(name)]
+        else:
+            folder = found[0]
+        self.state = sa.load_state(folder)
+        self.state_to_form()
+        self.session = None
+        self.info(f'Opened {folder}')
 
     def new_session(self):
         self.state = sa.default_state(subject='', session='d1')
