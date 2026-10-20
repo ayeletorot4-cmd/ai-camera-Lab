@@ -26,20 +26,29 @@ from scipy.signal import correlate
 AUDIO_RATE = 16000
 
 
-def read_audio(video_path, tmp_dir):
-    """Mono sound track of the video at AUDIO_RATE (needs macOS afconvert)."""
-    wav = os.path.join(tmp_dir, os.path.basename(video_path) + '.wav')
-    subprocess.run(['afconvert', '-f', 'WAVE', '-d', f'LEI16@{AUDIO_RATE}', '-c', '1', video_path, wav],
-                   check=True, capture_output=True)
-    _, x = wavfile.read(wav)
-    x = x.astype(np.float64)
+def read_audio(video_path, tmp_dir, max_s=600):
+    """Mono sound track of the video (its GoPro chapters one after the other) at AUDIO_RATE, at most max_s
+    seconds (needs macOS afconvert)."""
+    import video_source as vs
+    parts, total = [], 0
+    for k, p in enumerate(vs.chapters(video_path)):
+        wav = os.path.join(tmp_dir, f'{k}_{os.path.basename(p)}.wav')
+        subprocess.run(['afconvert', '-f', 'WAVE', '-d', f'LEI16@{AUDIO_RATE}', '-c', '1', p, wav],
+                       check=True, capture_output=True)
+        _, x = wavfile.read(wav)
+        parts.append(x.astype(np.float64))
+        total += len(x)
+        if max_s and total >= max_s * AUDIO_RATE:
+            break
+    x = np.concatenate(parts)[:int(max_s * AUDIO_RATE) if max_s else None]
     return (x - x.mean()) / (x.std() + 1e-9)
 
 
-def audio_offset(path_a, path_b):
-    """Seconds into video A at which video B started (negative: B started first), and a confidence ratio."""
+def audio_offset(path_a, path_b, max_s=600):
+    """Seconds into video A at which video B started (negative: B started first), and a confidence ratio.
+    Only the first max_s seconds of each video are used (enough unless the cameras started > max_s apart)."""
     with tempfile.TemporaryDirectory() as tmp:
-        a, b = read_audio(path_a, tmp), read_audio(path_b, tmp)
+        a, b = read_audio(path_a, tmp, max_s), read_audio(path_b, tmp, max_s)
     c = np.abs(correlate(a, b, mode='full', method='fft'))
     peak = int(np.argmax(c))
     # Confidence: the peak compared with the best peak more than 0.5 s away from it

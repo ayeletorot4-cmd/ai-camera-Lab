@@ -21,6 +21,8 @@ import time
 import cv2
 import numpy as np
 
+import video_source as vs
+
 MP_MAX_SIDE = 1280        # frames are shrunk to this before MediaPipe (its models work on ~256 px crops)
 MOTION_EVERY = 10         # camera movement is measured every 10th frame (it changes slowly)
 TOUCH_POINTS = {          # pose points that can touch a switch (both sides)
@@ -30,12 +32,9 @@ TOUCH_POINTS = {          # pose points that can touch a switch (both sides)
 
 
 def open_video(path):
-    """VideoCapture with the hardware decoder on macOS (sequential reading; jumping is approximate)."""
-    if sys.platform == 'darwin':
-        cap = cv2.VideoCapture(path, cv2.CAP_AVFOUNDATION)
-        if cap.isOpened():
-            return cap
-    return cv2.VideoCapture(path)
+    """The video (all its GoPro chapters) with the hardware decoder on macOS - sequential reading; jumping is
+    approximate there (see video_source.py)."""
+    return vs.VideoSource(path, hardware=True)
 
 
 def default_workers():
@@ -53,14 +52,13 @@ def load_cache(video_path, out_dir, boxes=None):
         return None
     d = dict(np.load(path, allow_pickle=False))
     meta = json.loads(str(d['meta']))
-    if meta.get('video_size') != os.path.getsize(video_path):
+    if meta.get('video_size') != vs.total_size(video_path):
         return None
     if boxes is not None and (np.shape(meta['boxes']) != np.shape(boxes) or not np.allclose(meta['boxes'], boxes)):
         return None
     if not meta.get('complete'):   # older caches used a too strict test: check against the video's length
-        cap = cv2.VideoCapture(video_path)
-        meta['complete'] = meta['frames'] >= int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) - max(2, meta['fps'])
-        cap.release()
+        src = vs.VideoSource(video_path, hardware=False)
+        meta['complete'] = meta['frames'] >= src.total_frames - max(2, meta['fps']) * len(src.paths)
     d['meta'] = meta
     return d
 
@@ -137,11 +135,10 @@ def _process_range(job):
 def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, workers=None):
     """Run the pass (in parallel parts) and save the cache. `progress(done_frames, total, seconds_left)` is
     called now and then; `should_stop()` -> True stops it (nothing is saved). Returns the cache dict."""
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    size = [int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))]
-    cap.release()
+    src = vs.VideoSource(video_path, hardware=False)    # all chapters of a GoPro clip
+    total = src.total_frames
+    fps = src.get(cv2.CAP_PROP_FPS) or 30.0
+    size = [int(src.get(cv2.CAP_PROP_FRAME_WIDTH)), int(src.get(cv2.CAP_PROP_FRAME_HEIGHT))]
     workers = workers or default_workers()
     workers = max(1, min(workers, total // 300 or 1))   # parts of at least ~5 s
     os.makedirs(out_dir, exist_ok=True)
@@ -192,8 +189,9 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
         os.remove(p)
     d = {k: np.concatenate([c[k] for c in chunks]) for k in chunks[0]}
     d['light'], d['touch_upper'], d['touch_lower'] = d['light'].T, d['touch_upper'].T, d['touch_lower'].T
-    meta = dict(video=os.path.abspath(video_path), video_size=os.path.getsize(video_path), fps=fps, size=size,
-                boxes=boxes, frames=len(d['times']), complete=len(d['times']) >= total - max(2, fps),
+    meta = dict(video=os.path.abspath(video_path), video_size=vs.total_size(video_path), fps=fps, size=size,
+                chapters=[os.path.basename(p) for p in src.paths],
+                boxes=boxes, frames=len(d['times']), complete=len(d['times']) >= total - max(2, fps) * len(src.paths),
                 seconds=round(time.time() - t0, 1), workers=workers)
     np.savez_compressed(cache_path(video_path, out_dir), meta=json.dumps(meta), **d)
     d['meta'] = meta

@@ -32,6 +32,8 @@ import cv2
 import numpy as np
 from scipy.optimize import least_squares
 
+import video_source as vs
+
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
 WINDOW = 'Camera calibration'
 
@@ -76,7 +78,7 @@ def load_cameras(path):
 
 
 def first_frame(path):
-    cap = cv2.VideoCapture(path)
+    cap = vs.VideoSource(path, hardware=False)
     ok, frame = cap.read()
     cap.release()
     if not ok:

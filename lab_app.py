@@ -22,6 +22,7 @@ import experiment_design as ed  # noqa: E402
 import extract_kinematics as ek  # noqa: E402
 import session_analysis as sa  # noqa: E402
 import session_engine as se  # noqa: E402
+import video_source as vs  # noqa: E402
 
 PART_CHOICES = [ed.IGNORE] + ed.PART_ORDER
 FLAG_COLOR = {'miss': '#f8d7da', 'not detected': '#e2e3e5', 'unknown': '#e2e3e5',
@@ -39,12 +40,8 @@ def to_pixmap(bgr):
 
 
 def read_frame(path, index=0):
-    cap = cv2.VideoCapture(path)
-    if index:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
-    ok, frame = cap.read()
-    cap.release()
-    return frame if ok else None
+    """A frame by its frame number (across GoPro chapters)."""
+    return vs.read_frame(path, index)
 
 
 def mmss(ms):
@@ -1097,7 +1094,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.resize(1500, 800)
         self.state = state
         self.saved_path = None
-        self.cap_a, self.cap_b = cv2.VideoCapture(state['cam_a']), cv2.VideoCapture(state['cam_b'])
+        self.cap_a, self.cap_b = vs.VideoSource(state['cam_a'], False), vs.VideoSource(state['cam_b'], False)
         self.fps_a = self.cap_a.get(cv2.CAP_PROP_FPS) or 30
         self.first = [read_frame(state['cam_a']), read_frame(state['cam_b'])]
         v = QtWidgets.QVBoxLayout(self)
