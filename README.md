@@ -46,6 +46,27 @@ How the light is measured: the pink LED light and its glow inside the box enlarg
 
 Pressing the button turns the light off, so Touching is usually 0-3 frames (0-50 ms) before Turn off. An empty cell means unknown: the light was already on when the video started (no Start), was still on when it ended (no Turn off), no touch was found, or (a row with only the switch number) that switch had no light events. Times are video time in ms; at 60 fps they are accurate to one frame (~17 ms).
 
+## Reaching Lab app (experiment sessions)
+A window app for whole experiment sessions: double-click **`Lab App.command`** (Mac) or **`Lab App.bat`** (Windows), or run `venv/bin/python lab_app.py`. Six steps on the left:
+
+1. **Session** - subject ID, day (d1 = familiarization, tests and practice; d2 = re-test day), the session video (one recording of the whole session; optional second camera + sync offset + calibration for 3D), and the design: tested arm, contralateral test yes/no, practice limb and side. The session plan is shown, e.g. Familiarization (2 blocks) → pre_test (3) → practice (10) → post_test (3) = 18 blocks. *Advanced*: trials per sequence (6), sequences per block (5), light window (1 s), pause that starts a new block (10 s), switch order (found automatically).
+2. **Switches** - finds the 5 switches automatically in the first minutes with lights (or from a later time), numbered from the subject's right to left; flip, redraw, add or remove a box by dragging.
+3. **Process** - one pass over each video (MediaPipe pose, the switch lights, hand/foot positions), saved so it runs once. On a Mac about 1.5 x the video's length (hardware video decoding + 3-4 MediaPipe workers).
+4. **Blocks & parts** - the groups of lights found (blocks = lights separated by the 30 s pauses) with the part each one belongs to, taken in order from the session plan; change a part or block number if needed (e.g. a block that was repeated). Warnings if the count doesn't match the plan, a block doesn't have 30 lights, or the wrist/ankle was poorly visible.
+5. **Trials** - like the old dataViewer: every trial with its outcome and marks, RT and MT, a *touse* tick box, the speed (or x / y / z / path) graph with light on, movement onset/end and hit, and the video frame at light on / movement onset / movement end / trial end with the marker and the target switch.
+6. **Export** - this session's two files, and one Excel file for all subjects.
+
+**Trials.** Each light (in the 6-switch order, matched so a missed or extra light doesn't shift the rest) is a trial: start = light on; end = the button hit (the light goes off when the button is pressed) or, if not hit within the 1 s window, the light turning off by itself (**miss**). Trials are marked when the participant **started moving before the light** (the reach toward the target began at home, 30-500 ms before the light) and when the participant **first went to another switch and then corrected** (the first movement ended at another switch and the right one was hit afterwards; not a failure - marked so you can decide).
+
+**Measures** - the same method as the previous MATLAB system (`calculateMeasures.m`): the marker (wrist for the upper limb, ankle for the lower limb; 3D with two calibrated cameras, otherwise its position in the camera image) is resampled to 100 Hz, filtered (Butterworth 2nd order, 10 Hz, zero-phase) and its speed computed; movement onset = last sample before the first speed peak after the light with speed < 5% of the peak (reaction time = onset - light on; 0 if already moving), movement end = first sample after the peak below 5% (movement time = end - onset); also AT, DT, AT/DT, number of speed peaks, straight-line deviation, end-point distance. One-frame MediaPipe glitches are removed first.
+
+**Outputs** (in `results/<subject>/<session>/`):
+- `<subject>_<session>_trials.csv` - every trial synced with the design: Part, Block, Sequence, Trial, Target, Limb, Side, Light_on_ms, Touch_ms (hand/foot reaches the switch in the video), Hit_ms, Light_off_ms, Trial_end_ms, Outcome (hit / miss / not detected), Anticipation (+ ms before the light), Corrected (+ the switch it went to first).
+- `<subject>_<session>_analysis.xlsx` - sheet *measures* (one row per trial: responsetime, movementtime, AT, DT, ..., touse) and the summary sheets of the old `makeCSVall.m`: mean / median / sd / iqr by part, by block and by sequence (familiarization and touse = 0 left out), plus *info*.
+- `results/analysis_all_subjects.xlsx` (Export → all subjects) - every analysed session together, a row per subject.
+
+`results/` holds participant data and is not uploaded to git.
+
 ## Two cameras (3D)
 Two cameras filming the same session from different angles give each joint's position in 3D, which fixes what one camera can't see (depth, a joint hidden behind the body, angles distorted by perspective). Three steps, on a Mac, from this folder:
 

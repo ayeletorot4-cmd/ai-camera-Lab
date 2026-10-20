@@ -3,3 +3,6 @@ mediapipe==0.10.21
 opencv-contrib-python==4.11.0.86
 numpy==1.26.4
 scipy  # two-camera scripts (sync_videos.py, calibrate_cameras.py)
+PySide6==6.8.1  # lab_app.py window
+openpyxl==3.1.5  # Excel output
+matplotlib  # graphs in lab_app.py
