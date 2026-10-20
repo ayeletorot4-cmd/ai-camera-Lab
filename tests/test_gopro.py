@@ -204,5 +204,102 @@ class ChapteredVideo(unittest.TestCase):
                          sum(os.path.getsize(os.path.join(d, f)) for f in ('GX010099.MP4', 'GX020099.MP4')))
 
 
+class FakeVideo:
+    """Frames are their own frame numbers; timestamps n / fps (ms) - like VideoSource."""
+
+    def __init__(self, n, fps):
+        self.n, self.fps, self.i, self.ms = n, fps, -1, 0.0
+
+    def grab(self):
+        if self.i + 1 >= self.n:
+            return False
+        self.i += 1
+        self.ms = self.i / self.fps * 1000
+        return True
+
+    def retrieve(self):
+        return True, self.i
+
+    def get(self, prop):
+        return self.ms
+
+
+class BoardPairing(unittest.TestCase):
+    def test_pairs_by_time(self):
+        import calibrate_cameras as cc
+        fps = 60000 / 1001
+        offset = 2.5          # B started 2.5 s into A
+        times = cc.sample_times(10.0, 10.0, offset, start_s=0, seconds=None, per_second=4)
+        self.assertAlmostEqual(times[0], 2.5)                    # no moment before B started
+        self.assertLess(times[-1], 10.0)                           # A ends first (at 10 s)
+        pairs = list(cc.paired_frames(FakeVideo(600, fps), FakeVideo(600, fps), offset, times, fps, fps))
+        for T, fa, fb in pairs:
+            self.assertEqual(fa, round(T * fps))                   # A's frame at T
+            self.assertEqual(fb, round((T - offset) * fps))        # B's frame at T - offset (same moment)
+        # B started first (negative offset): A's frame at T, B's later in its own file
+        times = cc.sample_times(10.0, 12.0, -1.0, per_second=2)
+        self.assertAlmostEqual(times[0], 0.0)
+        for T, fa, fb in cc.paired_frames(FakeVideo(600, fps), FakeVideo(720, fps), -1.0, times, fps, fps):
+            self.assertEqual(fb, round((T + 1.0) * fps))
+
+    def test_window(self):
+        import calibrate_cameras as cc
+        t = cc.sample_times(100, 100, 0, start_s=10, seconds=5, per_second=4)
+        self.assertAlmostEqual(t[0], 10)
+        self.assertAlmostEqual(t[-1], 14.75)
+
+
+def make_board_videos(folder, offset_frames, n_poses=70, fps=30, size=(1280, 720)):
+    """Two synthetic videos of the ChArUco board seen by two cameras with a known geometry; camera B starts
+    recording offset_frames later than A. Returns the true (R, t_mm)."""
+    import cv2
+    import calibrate_cameras as cc
+    board, _ = cc.make_board()
+    bw, bh = 950, 1330
+    tex = board.generateImage((bw, bh), marginSize=0)
+    mm_per_px = cc.BOARD_SQUARE_MM * cc.BOARD_SQUARES[0] / bw
+    K = cc.K_matrix(1000, size)
+    Rb = cv2.Rodrigues(np.array([0, 1, 0]) * np.radians(-40))[0]
+    tb = -Rb @ np.array([-900, 0, 300.0])
+    rng = np.random.default_rng(1)
+    poses = []
+    for _ in range(n_poses + offset_frames):
+        Rw = cv2.Rodrigues(rng.normal(0, 0.3, 3) + np.array([0, -0.35, 0]))[0]
+        tw = np.array([rng.uniform(-250, 50), rng.uniform(-200, 0), rng.uniform(1100, 1500)])
+        poses.append((Rw, tw))
+    S = np.diag([mm_per_px, mm_per_px, 1.0])
+    paths = [os.path.join(folder, 'A.mp4'), os.path.join(folder, 'B.mp4')]
+    for v, (R0, t0, first) in enumerate(((np.eye(3), np.zeros(3), 0), (Rb, tb, offset_frames))):
+        w = cv2.VideoWriter(paths[v], cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
+        for Rw, tw in poses[first:first + n_poses]:
+            R, t = R0 @ Rw, R0 @ tw + t0
+            H = K @ np.column_stack([R[:, 0], R[:, 1], t]) @ S
+            w.write(cv2.cvtColor(cv2.warpPerspective(tex, H, size, borderValue=150), cv2.COLOR_GRAY2BGR))
+        w.release()
+    return paths, Rb, tb
+
+
+class BoardCalibrationWithOffset(unittest.TestCase):
+    def test_offset_applied(self):
+        import cv2
+        import calibrate_cameras as cc
+        d = tempfile.mkdtemp()
+        fps, k = 30, 15
+        (a, b), R_true, t_true = make_board_videos(d, k, fps=fps)
+        res = cc.calibrate_board(a, b, offset_s=k / fps, seconds=0, per_second=fps)
+        rot_err = np.degrees(np.linalg.norm(cv2.Rodrigues(res['R'] @ R_true.T)[0]))
+        self.assertLess(rot_err, 2.5)
+        self.assertLess(np.linalg.norm(res['t_cm'] * 10 - t_true) / np.linalg.norm(t_true), 0.05)
+        self.assertAlmostEqual(res['square_mean_mm'], 38.0, delta=0.6)
+        self.assertLess(res['stereo_rms_px'], 1.0)
+        # Lockstep (the old behaviour = offset 0) pairs different moments: it must fail or look clearly wrong
+        try:
+            bad = cc.calibrate_board(a, b, offset_s=0.0, seconds=0, per_second=fps)
+            self.assertTrue(bad['stereo_rms_px'] > 5 or abs(bad['square_mean_mm'] - 38) > 3, bad['stereo_rms_px'])
+            self.assertFalse(bad['ok'])
+        except ValueError:
+            pass
+
+
 if __name__ == '__main__':
     unittest.main()
