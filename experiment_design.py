@@ -198,9 +198,30 @@ def assign_parts(blocks, template, settings):
     return out, warnings
 
 
+def parse_pattern(text):
+    """'1,4,3,5,4,2', '1 4 3 5 4 2' or '143542' (switch numbers are single digits) -> [1, 4, 3, 5, 4, 2]."""
+    text = str(text).strip()
+    if not text:
+        return []
+    if text.isdigit():
+        return [int(c) for c in text]
+    return [int(x) for x in text.replace(';', ',').replace(' ', ',').split(',') if x.strip()]
+
+
+def pattern_problem(pattern, settings):
+    """Why a typed switch order can't be right, or None."""
+    if not pattern:
+        return None
+    if any(not 1 <= p <= ek.N_SWITCHES for p in pattern):
+        return f'switch numbers must be 1-{ek.N_SWITCHES}'
+    if len(pattern) != settings.trials_per_sequence:
+        return f'{len(pattern)} switches, but a sequence has {settings.trials_per_sequence} trials'
+    return None
+
+
 def find_pattern(blocks, events, settings):
     """The 6-switch order: the first 6 lights of the blocks (most common), or the settings' pattern."""
-    if settings.pattern:
+    if settings.pattern and not pattern_problem(settings.pattern, settings):
         return list(settings.pattern)
     n = settings.trials_per_sequence
     starts = [tuple(events[i][0] for i in b[:n]) for b in blocks
@@ -324,6 +345,10 @@ def analyze_session(light, times_ms, fps, touch, template, settings, parts_overr
     warnings = [f'Switch {s}: its light was not seen by any camera - its trials are found from the timing '
                 '(1 s after the previous trial) and from where the hand/foot goes.'
                 for s in range(1, ek.N_SWITCHES + 1) if s not in seen] if events else []
+    problem = pattern_problem(settings.pattern, settings)
+    if problem:
+        warnings.append(f'The typed switch order {settings.pattern} is ignored ({problem}) - it is found from the '
+                        'lights instead. Type it as e.g. 1,4,3,5,4,2.')
     touch_any = np.minimum(touch['upper'], touch['lower'])
     events, delay = fill_hidden_lights(events, times_ms, fps, touch_any, settings)
     blocks = split_blocks(events, times_ms, settings)
