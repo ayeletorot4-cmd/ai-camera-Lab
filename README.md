@@ -58,6 +58,10 @@ A window app for whole experiment sessions: double-click **`Lab App.command`** (
 
 **Trials.** Each light (in the 6-switch order, matched so a missed or extra light doesn't shift the rest) is a trial: start = light on; end = the button hit (the light goes off when the button is pressed) or, if not hit within the 1 s window, the light turning off by itself (**miss**). Trials are marked when the participant **started moving before the light** (the reach toward the target began at home, 30-500 ms before the light) and when the participant **first went to another switch and then corrected** (the first movement ended at another switch and the right one was hit afterwards; not a failure - marked so you can decide).
 
+**Lights no camera sees** (e.g. an LED facing away): the next light always comes on ~1 s after a trial ends, so a gap with room for a trial is a hidden light - start = previous trial's end + 1 s, end = next light - 1 s (or the moment the hand/foot reaches the switch, at the end of a block); the switch = the one the hand/foot is on when it ends. These trials have *Light_source* = timing (video = the light was seen).
+
+**Two cameras, one stops early** (or starts late): the session timeline covers both videos; where only one camera recorded, only that one is used. Each trial uses 3D when both cameras see the marker, otherwise the camera that sees it best (column *Data*).
+
 **Measures** - the same method as the previous MATLAB system (`calculateMeasures.m`): the marker (wrist for the upper limb, ankle for the lower limb; 3D with two calibrated cameras, otherwise its position in the camera image) is resampled to 100 Hz, filtered (Butterworth 2nd order, 10 Hz, zero-phase) and its speed computed; movement onset = last sample before the first speed peak after the light with speed < 5% of the peak (reaction time = onset - light on; 0 if already moving), movement end = first sample after the peak below 5% (movement time = end - onset); also AT, DT, AT/DT, number of speed peaks, straight-line deviation, end-point distance. One-frame MediaPipe glitches are removed first.
 
 **Outputs** (in `results/<subject>/<session>/`):

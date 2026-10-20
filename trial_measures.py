@@ -160,39 +160,45 @@ def _homes(trials, track):
     return homes
 
 
-def measure_trials(trials, times_ms, track, switch_pos, switch_size, source='camera A', fallback=None):
-    """Add measures and flags to the trial rows (in place). `track`: (frames, 2 or 3) marker positions per
-    limb/side: {(limb, side): array}. switch_pos: (switches, dims) in the same coordinates.
-    fallback = (track, switch_pos, switch_size, source) used for a trial without enough data in `track`
-    (e.g. 3D needs both cameras to see the marker); distances are then left empty (other units)."""
+def measure_trials(trials, times_ms, sources):
+    """Add measures and flags to the trial rows (in place).
+    sources: list of dict(name, track={(limb, side): (frames, 2 or 3) marker positions}, switch_pos (switches,
+    dims), switch_size) - e.g. 3D, camera A, camera B. For each trial the first source is used if it gives a
+    result, else the one that saw the marker best during the trial. Distances (straightness, end point) are
+    only kept when the first source was used (other sources have other units)."""
     t_s = np.asarray(times_ms) / 1000
-    homes = _homes(trials, track)
-    fb_homes = _homes(trials, fallback[0]) if fallback else {}
+    homes = [_homes(trials, src['track']) for src in sources]
     for r in trials:
         r.update(dict.fromkeys(MEASURES, np.nan), anticipation=False, anticipation_ms=None, corrected_from=None,
-                 touse=r['Outcome'] == 'hit')
+                 touse=r['Outcome'] == 'hit', Data='')
         if r['on_frame'] is None or r.get('off_frame') is None:
             r['touse'] = False
             continue
         key = (r['Limb'], r['Side'])
         a, b = r['window_start'], r['off_frame']
-        tr, sp, ss, home, r['Data'] = track, switch_pos, switch_size, homes.get(key), source
-        k = trial_kinematics(t_s[a:b + 1], tr[key][a:b + 1], t_s[r['on_frame']])
-        m = calculate_measures(k, sp[r['Target'] - 1], home)
-        if np.isnan(m['responsetime']) and fallback:   # too little / too patchy data: use the fallback
-            tr, sp, ss, r['Data'] = fallback
-            home = fb_homes.get(key)
-            k = trial_kinematics(t_s[a:b + 1], tr[key][a:b + 1], t_s[r['on_frame']])
-            m = calculate_measures(k, sp[r['Target'] - 1], home)
-        if r['Data'] != source:
+        cover = [np.mean(~np.isnan(src['track'][key][a:b + 1, 0])) if key in src['track'] else 0 for src in sources]
+        order = [0] + sorted(range(1, len(sources)), key=lambda i: -cover[i])
+        k = m = None
+        for i in order:
+            if cover[i] == 0:
+                continue
+            src = sources[i]
+            k = trial_kinematics(t_s[a:b + 1], src['track'][key][a:b + 1], t_s[r['on_frame']])
+            m = calculate_measures(k, src['switch_pos'][r['Target'] - 1], homes[i].get(key))
+            if not np.isnan(m['responsetime']):
+                r['Data'] = src['name']
+                break
+        if m is None or not r['Data']:
+            r['touse'] = False
+            continue
+        if r['Data'] != sources[0]['name']:
             m['straighlinedeviation'] = m['endpointdistance'] = np.nan
         r.update({x: m.get(x, np.nan) for x in MEASURES})
         r['anticipation'], r['anticipation_ms'] = m['anticipation'], m['anticipation_ms']
         r['onset_s'], r['end_s'] = m.get('onset_s'), m.get('end_s')
         if r['Outcome'] == 'hit':
-            r['corrected_from'] = corrected_reach(k, m, t_s[r['off_frame']], r['Target'], sp, ss)
-        if k is None:
-            r['touse'] = False
+            r['corrected_from'] = corrected_reach(k, m, t_s[r['off_frame']], r['Target'], src['switch_pos'],
+                                                  src['switch_size'])
     return trials
 
 
@@ -200,8 +206,8 @@ def measure_trials(trials, times_ms, track, switch_pos, switch_size, source='cam
 # Output files
 # -----------------------------
 TRIAL_COLUMNS = ['Part', 'Block', 'Sequence', 'Trial', 'Target', 'Limb', 'Side', 'Light_on_ms', 'Touch_ms',
-                 'Hit_ms', 'Light_off_ms', 'Trial_end_ms', 'Outcome', 'Anticipation', 'Anticipation_ms',
-                 'Corrected', 'Corrected_from']
+                 'Hit_ms', 'Light_off_ms', 'Trial_end_ms', 'Outcome', 'Light_source', 'Anticipation',
+                 'Anticipation_ms', 'Corrected', 'Corrected_from']
 
 
 def _cell(v):
@@ -222,7 +228,7 @@ def write_trials_csv(path, trials):
         w = csv.writer(f)
         w.writerow(TRIAL_COLUMNS)
         for r in trials:
-            w.writerow([_cell(r.get(c)) for c in TRIAL_COLUMNS[:13]] +
+            w.writerow([_cell(r.get(c)) for c in TRIAL_COLUMNS[:14]] +
                        [_cell(r.get('anticipation')), _cell(r.get('anticipation_ms')),
                         int(r.get('corrected_from') is not None), _cell(r.get('corrected_from'))])
 
@@ -263,13 +269,15 @@ def summary_tables(rows_by_subject):
     return tables
 
 
-MEASURE_COLUMNS = (['Subject', 'Session', 'Part', 'Block', 'Sequence', 'Trial', 'Target', 'Outcome', 'Anticipation',
+MEASURE_COLUMNS = (['Subject', 'Session', 'Part', 'Block', 'Sequence', 'Trial', 'Target', 'Outcome', 'Light_source',
+                    'Anticipation',
                     'Anticipation_ms', 'Corrected', 'Corrected_from', 'Data'] + MEASURES + ['touse'])
 
 
 def measure_row(subject, session, r):
     return {'Subject': subject, 'Session': session, 'Part': r['Part'], 'Block': r['Block'],
             'Sequence': r['Sequence'], 'Trial': r['Trial'], 'Target': r['Target'], 'Outcome': r['Outcome'],
+            'Light_source': r.get('Light_source', ''),
             'Anticipation': bool(r.get('anticipation')), 'Anticipation_ms': r.get('anticipation_ms'),
             'Corrected': r.get('corrected_from') is not None, 'Corrected_from': r.get('corrected_from'),
             'Data': r.get('Data', ''),
