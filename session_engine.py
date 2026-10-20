@@ -57,6 +57,10 @@ def load_cache(video_path, out_dir, boxes=None):
         return None
     if boxes is not None and (np.shape(meta['boxes']) != np.shape(boxes) or not np.allclose(meta['boxes'], boxes)):
         return None
+    if not meta.get('complete'):   # older caches used a too strict test: check against the video's length
+        cap = cv2.VideoCapture(video_path)
+        meta['complete'] = meta['frames'] >= int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) - max(2, meta['fps'])
+        cap.release()
     d['meta'] = meta
     return d
 
@@ -189,7 +193,7 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     d = {k: np.concatenate([c[k] for c in chunks]) for k in chunks[0]}
     d['light'], d['touch_upper'], d['touch_lower'] = d['light'].T, d['touch_upper'].T, d['touch_lower'].T
     meta = dict(video=os.path.abspath(video_path), video_size=os.path.getsize(video_path), fps=fps, size=size,
-                boxes=boxes, frames=len(d['times']), complete=len(d['times']) >= total - 2,
+                boxes=boxes, frames=len(d['times']), complete=len(d['times']) >= total - max(2, fps),
                 seconds=round(time.time() - t0, 1), workers=workers)
     np.savez_compressed(cache_path(video_path, out_dir), meta=json.dumps(meta), **d)
     d['meta'] = meta

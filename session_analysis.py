@@ -68,140 +68,181 @@ def trial_key(r):
 
 def _first_frame_xy(cache, pts, frames):
     """Points (frames, 2) of a camera -> that camera's first-frame coordinates (camera movement removed)."""
-    out = np.full_like(pts, np.nan, dtype=float)
-    for k, i in enumerate(frames):
-        if i is None or np.isnan(pts[k, 0]):
-            continue
-        inv = cv2.invertAffineTransform(cache['motion'][i])
-        out[k] = inv[:, :2] @ pts[k] + inv[:, 2]
-    return out
+    M = cache['motion'][np.asarray(list(frames))].astype(float)        # (n, 2, 3): first frame -> frame
+    A, t = M[:, :, :2], M[:, :, 2]
+    det = A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0]
+    inv = np.stack([np.stack([A[:, 1, 1], -A[:, 0, 1]], -1), np.stack([-A[:, 1, 0], A[:, 0, 0]], -1)], 1) / det[:, None, None]
+    return np.einsum('nij,nj->ni', inv, np.asarray(pts, float) - t)
+
+
+def _nearest(ref_times, query, tol):
+    """Index of the nearest ref time for each query time, -1 if further than tol."""
+    if len(ref_times) == 0:
+        return np.full(len(query), -1)
+    j = np.clip(np.searchsorted(ref_times, query), 1, max(1, len(ref_times) - 1))
+    j = np.minimum(j, len(ref_times) - 1)
+    j = j - ((j > 0) & (np.abs(query - ref_times[j - 1]) < np.abs(ref_times[j] - query)))
+    j[np.abs(ref_times[j] - query) > tol] = -1
+    return j
 
 
 class Session:
-    """Loaded caches + analysis results of one session."""
+    """Loaded caches + analysis results of one session.
+
+    Timeline: the session clock is camera A's clock (camera B's time + the sync offset). It holds every frame of
+    camera A, plus camera B's frames from before camera A started and after it stopped - so if one camera
+    stops early (or starts late), the analysis continues with the other camera alone."""
 
     def __init__(self, state):
         self.state = state
         self.folder = session_dir(state)
-        self.A = se.load_cache(state['cam_a'], self.folder, state['boxes_a']) if state['cam_a'] else None
-        self.B = (se.load_cache(state['cam_b'], self.folder, state['boxes_b'])
-                  if state.get('cam_b') and state.get('boxes_b') else None)
+        self.cams = {}
+        for c in ('a', 'b'):
+            if state.get(f'cam_{c}') and state.get(f'boxes_{c}'):
+                cache = se.load_cache(state[f'cam_{c}'], self.folder, state[f'boxes_{c}'])
+                if cache is not None:
+                    self.cams[c] = cache
+        self.A, self.B = self.cams.get('a'), self.cams.get('b')
         self.result = None
-        self.kin = {}
+        self._timeline()
 
     @property
     def ready(self):
-        return self.A is not None
+        return bool(self.cams)
 
     @property
     def two_cameras(self):
-        return self.B is not None and bool(self.state.get('calibration'))
+        return self.A is not None and self.B is not None and bool(self.state.get('calibration'))
 
-    def b_frame_for(self):
-        """For each frame of camera A, the camera-B frame taken closest in time (or -1)."""
-        ta = self.A['times'] / 1000
-        tb = self.B['times'] / 1000 + self.state.get('offset_s', 0.0)
-        j = np.clip(np.searchsorted(tb, ta), 1, len(tb) - 1)
-        j = j - ((ta - tb[j - 1]) < (tb[j] - ta))
-        j[np.abs(tb[j] - ta) > 0.5 / max(1, self.B['meta']['fps'])] = -1
-        return j
+    def _timeline(self):
+        if not self.cams:
+            self.times, self.idx = np.zeros(0), {}
+            return
+        off = self.state.get('offset_s', 0.0) * 1000 if self.A is not None else 0.0
+        t = {c: self.cams[c]['times'] + (off if c == 'b' else 0.0) for c in self.cams}
+        fps = {c: self.cams[c]['meta']['fps'] for c in self.cams}
+        main = 'a' if 'a' in t else 'b'
+        parts = [t[main]]
+        if main == 'a' and 'b' in t:
+            half = 500 / fps['b']
+            parts = [t['b'][t['b'] < t['a'][0] - half], t['a'], t['b'][t['b'] > t['a'][-1] + half]]
+        self.times = np.concatenate(parts)
+        self.fps = fps[main]
+        self.idx = {c: _nearest(t[c], self.times, 500 / fps[c]) for c in t}
+        self.cam_times = t
+        self.coverage = {c: (t[c][0] / 1000, t[c][-1] / 1000) for c in t}
 
-    def a_frame_for_b(self, fb):
-        ta = self.A['times'] / 1000
-        t = self.B['times'][fb] / 1000 + self.state.get('offset_s', 0.0)
-        return int(np.clip(np.searchsorted(ta, t), 0, len(ta) - 1))
+    def to_master(self, c, frame):
+        """A camera's frame -> the session timeline frame closest in time."""
+        tt = self.cam_times[c][frame]
+        return int(np.clip(np.searchsorted(self.times, tt - 1e-6), 0, len(self.times) - 1))
+
+    def per_frame(self, c, arr):
+        """Per-frame array of camera c (frames first) on the session timeline (NaN where c has no frame)."""
+        i = self.idx[c]
+        out = np.full((len(self.times),) + arr.shape[1:], np.nan, dtype=float)
+        ok = i >= 0
+        out[ok] = arr[i[ok]]
+        return out
+
+    def track_2d(self, c, key):
+        """Marker of camera c on the session timeline, in that camera's first-frame image coordinates."""
+        cache = self.cams[c]
+        xy = tm.marker_track(cache['pose'], *key, cache['meta']['size'])
+        xy = _first_frame_xy(cache, xy, range(len(xy)))
+        return self.per_frame(c, xy)
 
     def analyze(self):
-        st, A = self.state, self.A
-        fps = A['meta']['fps']
-        times = A['times']
-        events = ed.light_events(A['light'], fps)
-        touch = {'upper': A['touch_upper'].copy(), 'lower': A['touch_lower'].copy()}
-        units = 'px (camera A image)'
-        if self.B is not None:
-            bf = self.b_frame_for()
-            ev_b = []
-            for s, on, off in ed.light_events(self.B['light'], self.B['meta']['fps']):
-                ev_b.append((s, self.a_frame_for_b(on) if on > 0 else 0,
-                             None if off is None else self.a_frame_for_b(off)))
-            events = ed.merge_camera_events(events, ev_b, fps)
-            ok = bf >= 0
-            for limb in touch:
-                tb = self.B[f'touch_{limb}']
-                touch[limb][:, ok] = np.minimum(touch[limb][:, ok], tb[:, bf[ok]])
+        st = self.state
+        n = len(self.times)
+        events = []
+        for c, cache in self.cams.items():
+            ev = [(s, self.to_master(c, on) if on > 0 else 0, None if off is None else self.to_master(c, off))
+                  for s, on, off in ed.light_events(cache['light'], cache['meta']['fps'])]
+            # A light 'still on' at the end of a camera that stopped early isn't a light still on in the session
+            events = ev if not events else ed.merge_camera_events(events, ev, self.fps)
+        touch = {}
+        for limb in ('upper', 'lower'):
+            arrs = [self.per_frame(c, cache[f'touch_{limb}'].T) for c, cache in self.cams.items()]
+            touch[limb] = np.nan_to_num(np.fmin.reduce(arrs) if len(arrs) > 1 else arrs[0], nan=np.inf).T
         template = template_of(st)
-        res = ed.analyze_session(events, times, fps, touch, template, settings_of(st), st.get('parts_override'))
+        res = ed.analyze_session(events, self.times, self.fps, touch, template, settings_of(st),
+                                 st.get('parts_override'))
+        if len(self.cams) == 2:
+            (a0, a1), (b0, b1) = self.coverage['a'], self.coverage['b']
+            for name, (x0, x1), other in (('A', (a0, a1), (b0, b1)), ('B', (b0, b1), (a0, a1))):
+                if x1 < other[1] - 5:
+                    res['warnings'].append(f'Camera {name} stopped at {x1 / 60:.1f} min - from there on only the '
+                                           f'other camera is used.')
+                if x0 > other[0] + 5:
+                    res['warnings'].append(f'Camera {name} started at {x0 / 60:.1f} min - before that only the '
+                                           f'other camera is used.')
 
-        # Marker tracks and switch positions (2D in camera A, or 3D with two calibrated cameras)
-        w, h = A['meta']['size']
-        boxes = np.array(st['boxes_a'])
-        centers_a = np.column_stack([(boxes[:, 0] + boxes[:, 2]) / 2 * w, (boxes[:, 1] + boxes[:, 3]) / 2 * h])
-        sizes = np.sqrt((boxes[:, 2] - boxes[:, 0]) * w * (boxes[:, 3] - boxes[:, 1]) * h)
-        tracks, n = {}, len(times)
-        tracks_a = {}
-        for p in template:
-            key = (p.limb, p.side)
-            if key not in tracks_a:
-                tracks_a[key] = _first_frame_xy(A, tm.marker_track(A['pose'], *key, A['meta']['size']), range(n))
-        fallback = None
+        # Marker sources: 3D (two calibrated cameras), then each camera's own image
+        keys = {(p.limb, p.side) for p in template}
+        sources, units = [], 'px (camera image)'
+        for c, cache in self.cams.items():
+            w, h = cache['meta']['size']
+            boxes = np.array(st[f'boxes_{c}'])
+            centers = np.column_stack([(boxes[:, 0] + boxes[:, 2]) / 2 * w, (boxes[:, 1] + boxes[:, 3]) / 2 * h])
+            sizes = np.sqrt((boxes[:, 2] - boxes[:, 0]) * w * (boxes[:, 3] - boxes[:, 1]) * h)
+            sources.append(dict(name=f'camera {c.upper()}', cam=c, switch_pos=centers, switch_size=sizes,
+                                track={k: self.track_2d(c, k) for k in keys}))
         if self.two_cameras:
             from calibrate_cameras import load_cameras, triangulate_px
-            (ca, cb), units = load_cameras(st['calibration'])
-            bf = self.b_frame_for()
-            bb = np.array(st['boxes_b'])
-            wb, hb = self.B['meta']['size']
-            centers_b = np.column_stack([(bb[:, 0] + bb[:, 2]) / 2 * wb, (bb[:, 1] + bb[:, 3]) / 2 * hb])
+            (ca, cb), cal_units = load_cameras(st['calibration'])
             tri = lambda pa, pb: triangulate_px(pa, pb, ca['K'], cb['K'], cb['R'], cb['t'], ca['dist'], cb['dist'])
-            switch_pos = tri(centers_a, centers_b)
-            switch_size = np.ones(len(switch_pos))
-            for p in template:
-                key = (p.limb, p.side)
-                if key in tracks:
-                    continue
-                pa = _first_frame_xy(A, tm.marker_track(A['pose'], *key, A['meta']['size']), range(n))
-                mb = tm.marker_track(self.B['pose'], *key, self.B['meta']['size'])
-                pb = _first_frame_xy(self.B, np.where((bf >= 0)[:, None], mb[np.maximum(bf, 0)], np.nan),
-                                     [int(x) if x >= 0 else None for x in bf])
+            sa_, sb_ = sources
+            track3 = {}
+            for k in keys:
+                pa, pb = sa_['track'][k], sb_['track'][k]
                 ok = ~np.isnan(pa[:, 0]) & ~np.isnan(pb[:, 0])
                 X = np.full((n, 3), np.nan)
                 if ok.any():
                     X[ok] = tri(pa[ok], pb[ok])
-                tracks[key] = X
-            units = f'3D, {units}'
-            fallback = (tracks_a, centers_a, sizes, 'camera A')
-            source = '3D'
-        else:
-            switch_pos, switch_size, tracks, source = centers_a, sizes, tracks_a, 'camera A'
-        tm.measure_trials(res['trials'], times, tracks, switch_pos, switch_size, source, fallback)
-        self.fallback = fallback
+                track3[k] = X
+            sources.insert(0, dict(name='3D', cam=None, switch_pos=tri(sa_['switch_pos'], sb_['switch_pos']),
+                                   switch_size=np.ones(len(sa_['switch_pos'])), track=track3))
+            units = f'3D, {cal_units} (trials marked camera A/B: px of that camera)'
+        tm.measure_trials(res['trials'], self.times, sources)
+        self.sources = {src['name']: src for src in sources}
         detected = [r for r in res['trials'] if r['on_frame'] is not None and r.get('off_frame') is not None]
-        with_data = [r for r in detected if not np.isnan(r['responsetime'])]
+        with_data = [r for r in detected if r.get('Data')]
         if detected and len(with_data) < 0.8 * len(detected):
             limbs = ', '.join(sorted({f"{r['Limb']} {r['Side']}" for r in detected}))
             res['warnings'].append(
                 f'The marker ({limbs}: wrist / ankle) was usable in only {len(with_data)} of {len(detected)} trials - '
-                'MediaPipe does not see it well from this camera (e.g. the far arm, hidden by the body).')
+                'MediaPipe does not see it well from the camera(s) (e.g. the far arm, hidden by the body).')
         over = st.get('touse_override') or {}
         for r in res['trials']:
             if trial_key(r) in over:
                 r['touse'] = bool(over[trial_key(r)])
-        self.tracks, self.switch_pos, self.switch_size, self.units = tracks, switch_pos, switch_size, units
+        self.units = units
+        self.switch_pos = sources[0]['switch_pos']
         self.result = res
         return res
 
     def trial_curves(self, r):
         """Kinematics of one trial for the graphs: dict(time, xyz, tangvel, stim) + measures (or None)."""
-        if r.get('on_frame') is None or r.get('off_frame') is None:
+        if r.get('on_frame') is None or r.get('off_frame') is None or not r.get('Data'):
             return None, None
-        t_s = self.A['times'] / 1000
+        src = self.sources[r['Data']]
+        t_s = self.times / 1000
         a, b = r['window_start'], r['off_frame']
-        key = (r['Limb'], r['Side'])
-        tracks, switch_pos = self.tracks, self.switch_pos
-        if r.get('Data') == 'camera A' and self.fallback:
-            tracks, switch_pos = self.fallback[0], self.fallback[1]
-        k = tm.trial_kinematics(t_s[a:b + 1], tracks[key][a:b + 1], t_s[r['on_frame']])
-        m = tm.calculate_measures(k, switch_pos[r['Target'] - 1]) if k else None
+        k = tm.trial_kinematics(t_s[a:b + 1], src['track'][(r['Limb'], r['Side'])][a:b + 1], t_s[r['on_frame']])
+        m = tm.calculate_measures(k, src['switch_pos'][r['Target'] - 1]) if k else None
         return k, m
+
+    def trial_switch_pos(self, r):
+        return self.sources[r['Data']]['switch_pos'] if r.get('Data') in self.sources else self.switch_pos
+
+    def frame_ref(self, f, prefer=None):
+        """Session-timeline frame -> (camera, that camera's frame) to show; prefer a camera if it has the frame."""
+        order = ([prefer] if prefer in self.idx else []) + [c for c in ('a', 'b') if c in self.idx]
+        for c in order:
+            if self.idx[c][f] >= 0:
+                return c, int(self.idx[c][f])
+        return None, None
 
     def set_touse(self, r, value):
         r['touse'] = bool(value)
@@ -215,6 +256,7 @@ class Session:
         tm.write_trials_csv(base + '_trials.csv', trials)
         rows = [tm.measure_row(st['subject'], st['session'], r) for r in trials]
         info = {'Subject': st['subject'], 'Session': st['session'], 'Camera A': st['cam_a'],
+                'Light gap filled from timing (s)': self.result.get('delay'),
                 'Camera B': st.get('cam_b') or '-', 'Units': self.units,
                 'Switch order': ', '.join(map(str, self.result['pattern'])),
                 'Warnings': ' | '.join(self.result['warnings']) or '-'}

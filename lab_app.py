@@ -682,7 +682,7 @@ class LabApp(QtWidgets.QMainWindow):
         self.l_blocks.setWordWrap(True)
         v.addWidget(self.l_blocks)
         self.t_blocks = QtWidgets.QTableWidget(0, 5)
-        self.t_blocks.setHorizontalHeaderLabels(['Starts at', 'Lights', 'Ends at', 'Part', 'Block # in part'])
+        self.t_blocks.setHorizontalHeaderLabels(['Starts at', 'Trials found', 'Ends at', 'Part', 'Block # in part'])
         self.t_blocks.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         v.addWidget(self.t_blocks, 1)
         row = QtWidgets.QHBoxLayout()
@@ -709,7 +709,7 @@ class LabApp(QtWidgets.QMainWindow):
             self.t_blocks.setRowCount(0)
             return
         res = self.session.result
-        times = self.session.A['times']
+        times = self.session.times
         ev = res['events']
         self.l_blocks.setText(
             f"<b>{len(res['blocks'])} groups of lights found</b>, switch order in a sequence: "
@@ -719,8 +719,15 @@ class LabApp(QtWidgets.QMainWindow):
         self.l_blocks.setTextFormat(Qt.RichText)
         self.t_blocks.setRowCount(len(res['blocks']))
         for i, (b, (part, no)) in enumerate(zip(res['blocks'], res['parts'])):
-            on, off = ev[b[0]][1], ev[b[-1]][2] or ev[b[-1]][1]
-            for c, text in enumerate([mmss(times[on]), str(len(b)), mmss(times[off])]):
+            on, off = ev[b[0]][1], ev[b[-1]][2] if ev[b[-1]][2] is not None else ev[b[-1]][1]
+            rows = [r for r in res['trials'] if r['block_index'] == i and r['on_frame'] is not None]
+            found = str(len(rows)) if part != ed.IGNORE else f'{len(b)} lights'
+            if rows and rows[-1]['off_frame'] is not None:
+                off = max(off, rows[-1]['off_frame'])
+            n_timing = sum(1 for r in rows if r.get('Light_source') == 'timing')
+            if n_timing:
+                found += f'  ({n_timing} from timing)'
+            for c, text in enumerate([mmss(times[on]), found, mmss(times[off])]):
                 it = QtWidgets.QTableWidgetItem(text)
                 it.setFlags(it.flags() & ~Qt.ItemIsEditable)
                 self.t_blocks.setItem(i, c, it)
@@ -764,7 +771,8 @@ class LabApp(QtWidgets.QMainWindow):
         flt.addWidget(self.k_flagged)
         flt.addStretch()
         left.addLayout(flt)
-        cols = ['Part', 'Blk', 'Seq', 'Trial', 'Target', 'Outcome', 'Anticip.', 'Corrected', 'RT (s)', 'MT (s)', 'touse']
+        cols = ['Part', 'Blk', 'Seq', 'Trial', 'Target', 'Outcome', 'Light', 'Anticip.', 'Corrected', 'RT (s)', 'MT (s)',
+                'Data', 'touse']
         self.t_trials = QtWidgets.QTableWidget(0, len(cols))
         self.t_trials.setHorizontalHeaderLabels(cols)
         self.t_trials.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -855,9 +863,10 @@ class LabApp(QtWidgets.QMainWindow):
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             vals = [r['Part'], r['Block'], r['Sequence'], r['Trial'], r['Target'], r['Outcome'],
+                    r.get('Light_source', ''),
                     f"yes ({r['anticipation_ms']:.0f} ms)" if r['anticipation'] else '',
                     f"from {r['corrected_from']}" if r['corrected_from'] else '',
-                    fmt(r['responsetime']), fmt(r['movementtime'])]
+                    fmt(r['responsetime']), fmt(r['movementtime']), r.get('Data', '')]
             color = (FLAG_COLOR.get(r['Outcome']) or (FLAG_COLOR['anticipation'] if r['anticipation'] else None)
                      or (FLAG_COLOR['corrected'] if r['corrected_from'] else None))
             for c, val in enumerate(vals):
@@ -901,7 +910,7 @@ class LabApp(QtWidgets.QMainWindow):
             ax.plot(xyz[:, 0], xyz[:, 1], '.', color='0.6', ms=3)
             if on_i is not None:
                 ax.plot(xyz[on_i:end_i + 1, 0], xyz[on_i:end_i + 1, 1], '-', lw=2.5, color='C0', label='movement')
-            sp = self.session.switch_pos
+            sp = self.session.trial_switch_pos(r)
             ax.scatter(sp[:, 0], sp[:, 1], marker='s', s=60, color='0.3')
             for i, p in enumerate(sp):
                 ax.annotate(str(i + 1), p[:2], color='C3' if i + 1 == r['Target'] else '0.3', fontsize=12,
@@ -959,7 +968,7 @@ class LabApp(QtWidgets.QMainWindow):
         if r is None or r.get('on_frame') is None:
             self.l_frame.clear()
             return
-        times = self.session.A['times']
+        times = self.session.times
         if which == 'light on':
             f = r['on_frame']
         elif which == 'trial end':
@@ -969,20 +978,26 @@ class LabApp(QtWidgets.QMainWindow):
             if t is None or np.isnan(t):
                 return
             f = int(np.clip(np.searchsorted(times, t * 1000), 0, len(times) - 1))
-        frame = read_frame(self.state['cam_a'], f)
+        prefer = {'camera A': 'a', 'camera B': 'b'}.get(r.get('Data'), 'a')
+        cam, cf = self.session.frame_ref(f, prefer)
+        if cam is None:
+            return
+        frame = read_frame(self.state[f'cam_{cam}'], cf)
         if frame is None:
             return
+        cache = self.session.cams[cam]
         # Marker and target
         j = {'upper': {'right': 16, 'left': 15}, 'lower': {'right': 28, 'left': 27}}[r['Limb']][r['Side']]
-        p = self.session.A['pose'][f, j]
+        p = cache['pose'][cf, j]
         sc = max(frame.shape[:2]) / 1280
         if not np.isnan(p[0]):
             cv2.drawMarker(frame, (int(p[0]), int(p[1])), (0, 0, 255), cv2.MARKER_CROSS, int(40 * sc), int(4 * sc))
-        w, h = self.session.A['meta']['size']
-        b = self.state['boxes_a'][r['Target'] - 1]
-        M = self.session.A['motion'][f]
+        w, h = cache['meta']['size']
+        b = self.state[f'boxes_{cam}'][r['Target'] - 1]
+        M = cache['motion'][cf]
         c = ek.box_corners(b, w, h, 0.0) @ M[:, :2].T + M[:, 2]
         cv2.polylines(frame, [c.astype(np.int32)], True, (0, 212, 255), int(3 * sc))
+        which = f'camera {cam.upper()}: {which}'
         cv2.putText(frame, f'{which}  {mmss(times[f])}', (int(20 * sc), int(50 * sc)), cv2.FONT_HERSHEY_SIMPLEX,
                     1.2 * sc, (255, 255, 255), int(3 * sc))
         pix = to_pixmap(frame)

@@ -7,10 +7,12 @@ Design: a block = 5 sequences x 6 reaching trials toward the lit switch, always 
 Trial = light on (start) -> button hit (end; the light goes off when the button is pressed) or, if the
 button is not hit within the 1 s window, the light turning off by itself (end; a miss).
 
-Steps: light events from the per-frame light levels (one or two cameras) -> blocks (gaps > block_gap_s
-between lights) -> parts (blocks taken in order from the template; the user can change it) -> inside a
-block, each light is matched to its place in the 6-switch order (a missed or extra light doesn't shift
-the rest) -> trial rows.
+Steps: light events from the per-frame light levels (one or two cameras) -> lights no camera saw (e.g. an LED
+facing away) filled in from the timing: the next light always comes on 1 s after a trial ends, so a gap with
+room for a trial between two lights is a hidden light (start = previous end + 1 s, end = next start - 1 s; the
+switch = where the hand/foot goes) -> blocks (gaps > block_gap_s between lights) -> parts (blocks taken in
+order from the template; the user can change it) -> inside a block, each light is matched to its place in the
+6-switch order (a missed or extra light doesn't shift the rest) -> trial rows.
 """
 from dataclasses import dataclass, field
 
@@ -31,6 +33,7 @@ class Settings:
     light_window_s: float = 1.0      # the light stays on at most this long when the button is not hit
     miss_margin_s: float = 0.06      # light on >= window - margin -> nobody pressed it (a miss)
     min_block_trials: int = 10       # shorter groups of lights (e.g. testing the lights) are ignored
+    fill_hidden_lights: bool = True  # infer lights no camera saw from the 1 s timing between trials
     pattern: list = field(default_factory=list)   # the 6-switch order; empty = found from the data
 
 
@@ -81,10 +84,78 @@ def merge_camera_events(ev_a, ev_b, fps, max_gap_s=0.2):
         used.add(k)
         _, on2, off2 = ev_b[k]
         on_m = min(on, on2) if on > 0 and on2 > 0 else max(on, on2)
-        off_m = None if off is None or off2 is None else max(off, off2)
+        # off None = still on when that camera's video ended: the other camera knows (unless it ended too)
+        offs = [o for o in (off, off2) if o is not None]
+        off_m = max(offs) if offs else None
         out.append((s, on_m, off_m))
     out += [e for i, e in enumerate(ev_b) if i not in used]
     return sorted(out, key=lambda e: e[1])
+
+
+def inter_trial_delay(events, times_ms):
+    """Typical time from a light going off to the next light coming on (s), or None."""
+    d = [(times_ms[b[1]] - times_ms[a[2]]) / 1000 for a, b in zip(events[:-1], events[1:])
+         if a[2] is not None and b[1] > 0]
+    d = [x for x in d if 0.3 < x < 1.6]
+    return float(np.median(d)) if len(d) >= 5 else None
+
+
+def _touched_switch(touch_any, on, off):
+    """The switch the hand/foot is on at the end of a hidden light (the press is what turns a light off - on the
+    way the hand can pass over a neighbouring switch), or 0 if it isn't near any switch then."""
+    n = touch_any.shape[1]
+    end = min(n, max(on + 1, off + 3))
+    seg = touch_any[:, max(on, end - 9):end]          # the last ~0.15 s
+    if seg.size == 0 or not np.isfinite(seg).any():
+        return 0
+    best = np.nanmin(np.where(np.isfinite(seg), seg, np.nan), axis=1)
+    s = int(np.nanargmin(best))
+    return s + 1 if best[s] <= 3 * ek.TOUCH_DIST else 0
+
+
+def _hidden_end(touch_any, s, on, fps, settings, limit):
+    """End of a hidden light: the first frame the hand/foot is on the switch (= the press turns it off; s = 0:
+    on any switch, after first leaving the one it started at), else the end of the light window (a miss)."""
+    window = int(round(settings.light_window_s * fps))
+    stop = min(on + window, limit)
+    rows = touch_any[[s - 1]] if s > 0 else touch_any
+    seg = rows[:, on:stop] <= ek.TOUCH_DIST
+    if s == 0:
+        seg &= ~(rows[:, on:on + 1] <= ek.TOUCH_DIST)     # not the switch it was already touching
+    hit = np.nonzero(seg.any(axis=0))[0]
+    return on + int(hit[0]) if len(hit) else stop
+
+
+def fill_hidden_lights(events, times_ms, fps, touch_any, settings):
+    """Insert the lights no camera saw. Events become (switch, on, off, source): source 'video' or 'timing'.
+    Switch 0 = hidden light whose switch couldn't be told (no hand/foot near any switch)."""
+    events = [tuple(e[:3]) + ('video',) for e in events]
+    delay = inter_trial_delay(events, times_ms) if settings.fill_hidden_lights else None
+    if delay is None:
+        return events, None
+    n = len(times_ms)
+    to_frame = lambda ms: int(np.clip(np.searchsorted(times_ms, ms), 0, n - 1))
+    min_trial = 0.15
+    out = []
+    for k, e in enumerate(events):
+        out.append(e)
+        nxt = events[k + 1] if k + 1 < len(events) else None
+        if e[2] is None or nxt is None or nxt[1] <= 0:
+            continue
+        end_ms, next_on_ms = times_ms[e[2]], times_ms[nxt[1]]
+        # Room for one more trial in this gap? (it's not the pause between blocks)
+        while (next_on_ms - end_ms) / 1000 >= 2 * delay + min_trial and \
+                (next_on_ms - end_ms) / 1000 < settings.block_gap_s:
+            on = to_frame(end_ms + delay * 1000)
+            off_by_timing = to_frame(next_on_ms - delay * 1000)
+            if (times_ms[off_by_timing] - times_ms[on]) / 1000 <= settings.light_window_s + 0.1:
+                off = off_by_timing                       # the next light came 1 s after this one ended
+            else:                                         # two or more hidden lights: end from the touch
+                off = _hidden_end(touch_any, 0, on, fps, settings, off_by_timing)
+            s = _touched_switch(touch_any, on, off + 2)
+            out.append((s, on, off, 'timing'))
+            end_ms = times_ms[off]
+    return out, delay
 
 
 # -----------------------------
@@ -93,7 +164,8 @@ def merge_camera_events(ev_a, ev_b, fps, max_gap_s=0.2):
 def split_blocks(events, times_ms, settings):
     """Groups of event indices separated by pauses longer than block_gap_s."""
     blocks, cur = [], []
-    for i, (_, on, _) in enumerate(events):
+    for i, e in enumerate(events):
+        on = e[1]
         if cur and (times_ms[on] - times_ms[events[cur[-1]][1]]) / 1000 > settings.block_gap_s:
             blocks.append(cur)
             cur = []
@@ -133,6 +205,7 @@ def find_pattern(blocks, events, settings):
     n = settings.trials_per_sequence
     starts = [tuple(events[i][0] for i in b[:n]) for b in blocks
               if len(b) >= settings.min_block_trials]
+    starts = [st for st in starts if 0 not in st and len(st) == n] or starts
     if not starts:
         return []
     values, counts = np.unique(np.array(starts), axis=0, return_counts=True)
@@ -155,7 +228,8 @@ def align_block(targets, pattern, n_sequences):
         back[0, j] = 3
     for i in range(1, E + 1):
         for j in range(1, O + 1):
-            d = score[i - 1, j - 1] + (MATCH if expected[i - 1] == targets[j - 1] else MISMATCH)
+            t = targets[j - 1]   # 0 = a hidden light whose switch is unknown: fits anywhere, but weaker
+            d = score[i - 1, j - 1] + (MATCH if expected[i - 1] == t else 1.0 if t == 0 else MISMATCH)
             u = score[i - 1, j] + SKIP_E
             l = score[i, j - 1] + SKIP_O
             best = max(d, u, l)
@@ -166,7 +240,7 @@ def align_block(targets, pattern, n_sequences):
     mapping = {}
     while i > 0 and j > 0:
         if back[i, j] == 1:
-            if expected[i - 1] == targets[j - 1]:
+            if expected[i - 1] == targets[j - 1] or targets[j - 1] == 0:
                 mapping[i - 1] = j - 1
             i, j = i - 1, j - 1
         elif back[i, j] == 2:
@@ -179,7 +253,7 @@ def align_block(targets, pattern, n_sequences):
 # -----------------------------
 # Trials
 # -----------------------------
-def build_trials(events, times_ms, fps, blocks, parts, template, settings, touch, pattern):
+def build_trials(events, times_ms, fps, blocks, parts, template, settings, touch, pattern, delay=None):
     """Trial rows for all blocks that belong to a part. `touch`: {'upper'/'lower': (switches, frames)}
     hand/foot distance to each switch box (box sizes)."""
     limb_of = {p.name: (p.limb, p.side) for p in template}
@@ -191,15 +265,32 @@ def build_trials(events, times_ms, fps, blocks, parts, template, settings, touch
         if part == IGNORE:
             continue
         limb, side = limb_of.get(part, ('upper', 'right'))
-        mapping = align_block([events[i][0] for i in block], pattern, settings.sequences_per_block)
+        # A light found from the timing fits its place whatever switch the hand was nearest to (less certain)
+        mapping = align_block([0 if len(events[i]) > 3 and events[i][3] == 'timing' else events[i][0]
+                               for i in block], pattern, settings.sequences_per_block)
         first_slot = min(mapping) if mapping else 0
         for slot in range(first_slot, len(pattern) * settings.sequences_per_block):
             seq, trial = slot // len(pattern) + 1, slot % len(pattern) + 1
             row = dict(Part=part, Block=block_no, Sequence=seq, Trial=trial, Target=pattern[slot % len(pattern)],
                        Limb=limb, Side=side, Light_on_ms=None, Hit_ms=None, Light_off_ms=None, Trial_end_ms=None,
-                       Touch_ms=None, Outcome='not detected', on_frame=None, off_frame=None, block_index=bi)
-            if slot in mapping:
-                s, on, off = events[block[mapping[slot]]]
+                       Touch_ms=None, Outcome='not detected', on_frame=None, off_frame=None, block_index=bi,
+                       Light_source='')
+            ev = events[block[mapping[slot]]] if slot in mapping else None
+            prev = rows[-1] if rows and rows[-1]['block_index'] == bi else None
+            if ev is None and delay is not None and prev is not None and prev['off_frame'] is not None \
+                    and not any(k > slot for k in mapping):
+                # A hidden light at the end of the block: 1 s after the previous trial, ended by the touch
+                on = int(np.clip(np.searchsorted(times_ms, times_ms[prev['off_frame']] + delay * 1000), 0, n - 1))
+                touch_any = np.minimum(touch['upper'], touch['lower'])
+                target = pattern[slot % len(pattern)]
+                window = int(round(settings.light_window_s * fps))
+                near = touch_any[target - 1, on:min(n, on + window + 2)]
+                # Only if the hand/foot really went to that switch (else the block simply ended)
+                if on < n - 1 and np.isfinite(near).any() and np.nanmin(near) <= 3 * ek.TOUCH_DIST:
+                    ev = (target, on, _hidden_end(touch_any, target, on, fps, settings, n - 1), 'timing')
+            if ev is not None:
+                s, on, off = ev[:3]
+                row['Light_source'] = ev[3] if len(ev) > 3 else 'video'
                 row.update(on_frame=on, off_frame=off, Light_on_ms=ms(on) if on > 0 else None,
                            Light_off_ms=ms(off))
                 if off is None or on == 0:
@@ -212,7 +303,7 @@ def build_trials(events, times_ms, fps, blocks, parts, template, settings, touch
                 row['Trial_end_ms'] = ms(off)
                 # First frame the hand/foot is on the lit switch (from the video)
                 end = n if off is None else min(n, off + 2)
-                d = touch[limb][s - 1, on:end]
+                d = touch[limb][row['Target'] - 1, on:end]
                 hit = np.nonzero(d <= ek.TOUCH_DIST)[0]
                 if len(hit):
                     row['Touch_ms'] = ms(on + int(hit[0]))
@@ -226,21 +317,32 @@ def build_trials(events, times_ms, fps, blocks, parts, template, settings, touch
 
 
 def analyze_session(light, times_ms, fps, touch, template, settings, parts_override=None):
-    """Everything from per-frame light levels to trial rows. Returns dict(events, blocks, parts, pattern,
-    trials, warnings). `parts_override`: the user's part for each block (same order as blocks)."""
+    """Everything from per-frame light levels (or a list of light events) to trial rows. Returns dict(events,
+    blocks, parts, pattern, trials, warnings, delay). `parts_override`: the user's part for each block."""
     events = light_events(light, fps) if not isinstance(light, list) else light
+    seen = {e[0] for e in events}
+    warnings = [f'Switch {s}: its light was not seen by any camera - its trials are found from the timing '
+                '(1 s after the previous trial) and from where the hand/foot goes.'
+                for s in range(1, ek.N_SWITCHES + 1) if s not in seen] if events else []
+    touch_any = np.minimum(touch['upper'], touch['lower'])
+    events, delay = fill_hidden_lights(events, times_ms, fps, touch_any, settings)
     blocks = split_blocks(events, times_ms, settings)
-    parts, warnings = assign_parts(blocks, template, settings)
+    parts, w = assign_parts(blocks, template, settings)
+    warnings += w
     if parts_override is not None and len(parts_override) == len(blocks):
         parts = [tuple(p) for p in parts_override]
-        warnings = []
+        warnings = [x for x in warnings if 'session plan has' not in x]
     pattern = find_pattern(blocks, events, settings)
-    if not pattern:
-        return dict(events=events, blocks=blocks, parts=parts, pattern=[], trials=[],
-                    warnings=warnings + ['No blocks found - no trials.'])
-    trials = build_trials(events, times_ms, fps, blocks, parts, template, settings, touch, pattern)
-    for (part, no), b in zip(parts, blocks):
-        if part != IGNORE and len(b) != settings.trials_per_sequence * settings.sequences_per_block:
-            warnings.append(f'{part} block {no}: {len(b)} lights instead of '
-                            f'{settings.trials_per_sequence * settings.sequences_per_block}.')
-    return dict(events=events, blocks=blocks, parts=parts, pattern=pattern, trials=trials, warnings=warnings)
+    if not pattern or 0 in pattern:
+        return dict(events=events, blocks=blocks, parts=parts, pattern=pattern, trials=[], delay=delay,
+                    warnings=warnings + ['Could not find the switch order - type it in (Session > Advanced).'])
+    trials = build_trials(events, times_ms, fps, blocks, parts, template, settings, touch, pattern, delay)
+    expected = settings.trials_per_sequence * settings.sequences_per_block
+    for bi, ((part, no), b) in enumerate(zip(parts, blocks)):
+        if part == IGNORE:
+            continue
+        got = sum(1 for r in trials if r['block_index'] == bi and r['on_frame'] is not None)
+        if got != expected:
+            warnings.append(f'{part} block {no}: {got} trials found instead of {expected}.')
+    return dict(events=events, blocks=blocks, parts=parts, pattern=pattern, trials=trials, warnings=warnings,
+                delay=delay)
