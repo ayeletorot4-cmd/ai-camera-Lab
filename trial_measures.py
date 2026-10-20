@@ -8,7 +8,11 @@ Port of loaddata.m + calculateMeasures.m + makeCSVsubject.m / makeCSVall.m:
     differentiated, and the tangential velocity is the speed
   - first peak = the first speed peak (> 30% of the maximum after the light came on) after the light came on
   - movement onset = the last sample between the light coming on and the first peak with speed < 5% of the
-    maximum (the light-on sample if there is none) -> reaction time (responsetime) = onset - light on
+    maximum (calculateMeasures.m). If the speed never drops below 5% there (the resting hand drifting slightly,
+    or the end of the return home) calculateMeasures.m fell back to the light-on sample, giving RT ~ 0; here the
+    same 5% rule is then measured from the resting level instead of from 0: the last sample with speed <= the
+    lowest speed between the light and the peak + 5% of the maximum -> reaction time (responsetime) = onset -
+    light on
   - negative reaction times: if the reach toward the target already started before the light (the same < 5%
     search, but looking back before the light, at most ANTICIPATION_MAX_S), that earlier sample is the onset
     and the reaction time is negative (the subject knew the next light of the sequence). The data of each
@@ -111,25 +115,29 @@ def calculate_measures(k, target_pos, home_pos=None):
     if maxtv <= 0 or len(after) == 0:
         return empty
     first = int(after[0])
-    below = np.nonzero(tv[s:first + 1] < 0.05 * maxtv)[0]
-    onset = s + int(below[-1]) if len(below) else s
-
-    # Started before the light? Follow the speed back from the first peak while it keeps falling, down to < 5% of
-    # the maximum: the start of the rise into the reach (a slow drift of the resting hand, above 5% but not
-    # rising, doesn't count). It counts if that is at most ANTICIPATION_MAX_S before the light and the hand/foot
-    # was then moving toward the target (not e.g. still returning home from the previous trial).
+    seg_tv = tv[s:first + 1]
+    below = np.nonzero(seg_tv < 0.05 * maxtv)[0]
+    if len(below):
+        onset = s + int(below[-1])                                   # calculateMeasures.m
+    else:                                                            # never < 5%: 5% above the resting level
+        onset = s + int(np.nonzero(seg_tv <= seg_tv.min() + 0.05 * maxtv)[0][-1])
+    # Start of the rise into the first peak (back from the peak while the speed keeps falling, until < 5%) -
+    # only to tell whether the reach began before the light (a slow drift is not a rise)
+    rise = first
+    while rise > 0 and tv[rise - 1] < tv[rise] and tv[rise] >= 0.05 * maxtv:
+        rise -= 1
+    # Started before the light? It counts if the rise began at most ANTICIPATION_MAX_S before the light and the
+    # hand/foot was then moving toward the target (not e.g. still returning home from the previous trial); then
+    # the onset is that earlier moment and the reaction time is negative.
     anticipation = False
-    free_onset = first
-    while free_onset > 0 and tv[free_onset - 1] < tv[free_onset] and tv[free_onset] >= 0.05 * maxtv:
-        free_onset -= 1
-    lead = stim - time[free_onset]
+    lead = stim - time[rise]
     if ANTICIPATION_MIN_S < lead <= ANTICIPATION_MAX_S and target_pos is not None:
         v = k['vel'][s]
         to_target = np.asarray(target_pos, float) - xyz[s]
         nv, nt = np.linalg.norm(v), np.linalg.norm(to_target)
         if nv > 0.05 * maxtv and nt > 0 and np.dot(v, to_target) / (nv * nt) > TOWARD_COS:
             anticipation = True
-            onset = free_onset
+            onset = rise
 
     below = np.nonzero(tv[first:] < 0.05 * maxtv)[0]
     end = first + int(below[0]) if len(below) else len(time) - 1

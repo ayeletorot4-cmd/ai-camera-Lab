@@ -70,6 +70,18 @@ class NegativeReactionTime(unittest.TestCase):
         self.assertFalse(m['anticipation'])
         self.assertGreaterEqual(m['responsetime'], 0)
 
+    def test_slow_drift_before_the_reach(self):
+        """The resting hand drifts slowly (above 5% of the peak speed) until the reach starts 0.3 s after the light:
+        calculateMeasures.m found no sample < 5% and gave RT ~ 0; the onset is now where the reach starts."""
+        stim = 1.0
+        t = np.arange(0, stim + 1.2, 1 / FPS)
+        drift = np.column_stack([150.0 * t, np.zeros_like(t)])          # 150 px/s sideways (~9% of the peak)
+        go = reach(np.zeros(2), SWITCHES[2], stim + 0.3, 0.4)(t)
+        p = drift + go
+        m, _ = measure(t, p, stim, 3)
+        self.assertFalse(m['anticipation'])
+        self.assertAlmostEqual(m['responsetime'], 0.3, delta=0.07)
+
 
 class NotFromHome(unittest.TestCase):
     def test_shortcut_from_the_previous_switch(self):
