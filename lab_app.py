@@ -276,28 +276,53 @@ class LabApp(QtWidgets.QMainWindow):
 
         f = QtWidgets.QFormLayout()
         self.e_cam_a = QtWidgets.QLineEdit()
+        self.e_cam_a.editingFinished.connect(lambda: self.on_video_chosen(self.e_cam_a))
         f.addRow('Camera A video', path_row(self.e_cam_a, lambda: self.browse_video(self.e_cam_a)))
         self.e_cam_b = QtWidgets.QLineEdit()
+        self.e_cam_b.editingFinished.connect(lambda: self.on_video_chosen(self.e_cam_b))
         clr = QtWidgets.QPushButton('Clear')
-        clr.clicked.connect(lambda: self.e_cam_b.clear())
+        clr.clicked.connect(lambda: (self.e_cam_b.clear(), self.l_videos.clear()))
         f.addRow('Camera B video (optional)', path_row(self.e_cam_b, lambda: self.browse_video(self.e_cam_b), [clr]))
+        self.l_videos = QtWidgets.QLabel()
+        self.l_videos.setWordWrap(True)
+        self.l_videos.setTextFormat(Qt.RichText)
+        f.addRow('', self.l_videos)
         self.s_offset = QtWidgets.QDoubleSpinBox()
-        self.s_offset.setRange(-3600, 3600)
-        self.s_offset.setDecimals(3)
+        self.s_offset.setRange(-36000, 36000)
+        self.s_offset.setDecimals(4)
         self.s_offset.setSuffix(' s')
-        b_snd = QtWidgets.QPushButton('Find from the sound')
+        b_tc = QtWidgets.QPushButton('From timecode')
+        b_tc.setToolTip('GoPro cameras synced in the Quik app (Sync Timecode): the offset from the start timecodes')
+        b_tc.clicked.connect(lambda: self.auto_offset(force=True))
+        b_snd = QtWidgets.QPushButton('From the sound')
         b_snd.clicked.connect(self.find_offset)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.s_offset)
+        row.addWidget(b_tc)
         row.addWidget(b_snd)
-        row.addWidget(QtWidgets.QLabel('seconds into video A at which video B started (0 for cameras with a shared timecode)'))
+        row.addWidget(QtWidgets.QLabel('seconds into video A at which video B started'))
         row.addStretch()
         f.addRow('Sync offset', row)
+        self.l_sync = QtWidgets.QLabel()
+        self.l_sync.setWordWrap(True)
+        self.l_sync.setTextFormat(Qt.RichText)
+        f.addRow('', self.l_sync)
         self.e_calib = QtWidgets.QLineEdit()
+        b_board = QtWidgets.QPushButton('Board calibration…')
+        b_board.setToolTip('The printed ChArUco board filmed by both cameras (start of the session, or separate clips)')
+        b_board.clicked.connect(self.board_calibration)
         b_click = QtWidgets.QPushButton('Click calibration…')
         b_click.clicked.connect(self.click_calibration)
-        f.addRow('Camera calibration', path_row(self.e_calib, self.browse_calib, [b_click]))
-        v.addWidget(group('Videos (one recording of the whole session per camera)', f))
+        b_reuse = QtWidgets.QPushButton('Use an earlier calibration…')
+        b_reuse.setToolTip('A calibration file of an earlier recording of the same day - only if the cameras were '
+                           'not moved since')
+        b_reuse.clicked.connect(self.browse_calib)
+        crow = QtWidgets.QHBoxLayout()
+        crow.addWidget(self.e_calib, 1)
+        for b in (b_board, b_click, b_reuse):
+            crow.addWidget(b)
+        f.addRow('Camera calibration', crow)
+        v.addWidget(group('Videos (one recording of the whole session per camera; GoPro: choose the first chapter)', f))
 
         f = QtWidgets.QFormLayout()
         self.c_tested = QtWidgets.QComboBox()
@@ -358,16 +383,105 @@ class LabApp(QtWidgets.QMainWindow):
                             + f'   =  {sum(p.blocks for p in parts)} blocks')
 
     def browse_video(self, edit):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose a video', os.path.join(sa.PROJECT_DIR, 'media'),
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose a video (GoPro: the first chapter, GX01....MP4)',
+                                                     os.path.join(sa.PROJECT_DIR, 'media'),
                                                      'Videos (*.mov *.mp4 *.avi *.mkv *.MOV *.MP4)')
         if p:
             edit.setText(p)
+            self.on_video_chosen(edit)
 
     def browse_calib(self):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Camera calibration file',
-                                                     os.path.join(sa.PROJECT_DIR, 'outputs'), 'JSON (*.json)')
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, 'Calibration file of an earlier recording (cameras not moved since)', sa.session_dir(self.state)
+            if os.path.isdir(sa.session_dir(self.state)) else sa.RESULTS_DIR, 'JSON (*.json)')
         if p:
             self.e_calib.setText(p)
+            self.save()
+
+    def on_video_chosen(self, edit):
+        """GoPro chapters: use the first one, show them and check they follow each other; then the offset."""
+        path = edit.text().strip()
+        if path and os.path.exists(path):
+            first = vs.first_chapter(path)
+            if first != path:
+                edit.setText(first)
+                self.info(f'Using the first chapter of that clip: {os.path.basename(first)}')
+        self.describe_videos()
+        self.auto_offset()
+
+    def describe_videos(self):
+        import timecode
+        lines = []
+        info = {}
+        for cam, edit in (('A', self.e_cam_a), ('B', self.e_cam_b)):
+            path = edit.text().strip()
+            if not path or not os.path.exists(path):
+                continue
+            src = vs.VideoSource(path, hardware=False)
+            c = src.info[0]
+            info[cam] = c
+            names = ', '.join(os.path.basename(p) for p in src.paths)
+            length = f'{src.total_ms / 60000:.1f} min' if src.total_ms >= 60000 else f'{src.total_ms / 1000:.1f} s'
+            text = (f'<b>{cam}</b>: {c["width"]}x{c["height"]}, {c["fps"]:.3f} fps, {length}'
+                    + (f' - {len(src.paths)} chapters ({names})' if len(src.paths) > 1 else ''))
+            warn = src.check() + timecode.chapter_gaps(path)
+            if warn:
+                text += '<br><span style="color:#b00">' + '<br>'.join(warn) + '</span>'
+            lines.append(text)
+        if len(info) == 2:
+            a, b = info['A'], info['B']
+            if (a['width'], a['height']) != (b['width'], b['height']) or abs(a['fps'] - b['fps']) > 0.01:
+                lines.append('<span style="color:#b00">The two videos differ in resolution or frame rate - record both '
+                             'cameras with the same settings (4K, 60 fps, Linear, HyperSmooth off).</span>')
+        self.l_videos.setText('<br>'.join(lines))
+
+    def auto_offset(self, force=False):
+        """Both videos chosen: the offset from the GoPro timecodes, and from the sound as a cross-check."""
+        import timecode
+        a, b = self.e_cam_a.text().strip(), self.e_cam_b.text().strip()
+        if not (a and b and os.path.exists(a) and os.path.exists(b)):
+            return
+        try:
+            off, ta, tb = timecode.timecode_offset(a, b)
+        except Exception as e:
+            if force:
+                self.error(f'Could not get the offset from the timecodes:\n{e}')
+            first = str(e).splitlines()[0].replace(os.path.dirname(a) + os.sep, '').replace(os.path.dirname(b) + os.sep, '')
+            self.l_sync.setText(f'No timecode offset ({first}) - use "From the sound" or type it in.')
+            return
+        self.s_offset.setValue(off)
+        fps = ta['fps']
+        note = '' if ta['source'] == 'ffprobe' else ' (read from the files - ffprobe not installed)'
+        self.l_sync.setText(f'From the timecodes{note}: A starts {ta["timecode"]}, B starts {tb["timecode"]} '
+                            f'→ offset {off:+.4f} s. Checking against the sound…')
+        self.form_to_state()
+        self.save()
+        if sys.platform != 'darwin':
+            self.l_sync.setText(self.l_sync.text().replace('Checking against the sound…', '(sound check needs macOS)'))
+            return
+
+        def job(progress, stop):
+            import sync_videos
+            return sync_videos.audio_offset(a, b)
+
+        def done(r):
+            snd, conf = r
+            diff = abs(snd - off) * fps
+            base = self.l_sync.text().replace(' Checking against the sound…', '')
+            if conf < 1.5:
+                msg = f' Sound: {snd:+.4f} s, but the sound match is unclear - not used as a check.'
+            elif diff > 1:
+                msg = (f'<br><span style="color:#b00"><b>Warning:</b> the sound gives {snd:+.4f} s, '
+                       f'{diff:.1f} frames from the timecode offset - check the cameras\' timecode sync.</span>')
+            else:
+                msg = f' <span style="color:#080">Sound agrees: {snd:+.4f} s ({diff:.2f} frames apart).</span>'
+            self.l_sync.setText(base + msg)
+
+        self.sync_worker = Worker(job)
+        self.sync_worker.done.connect(done)
+        self.sync_worker.failed.connect(lambda m: self.l_sync.setText(
+            self.l_sync.text().replace('Checking against the sound…', f'(sound check failed: {m})')))
+        self.sync_worker.start()
 
     def state_to_form(self):
         s = self.state
@@ -389,6 +503,11 @@ class LabApp(QtWidgets.QMainWindow):
         self.s_gap.setValue(st['block_gap_s'])
         self.e_pattern.setText(','.join(map(str, st.get('pattern') or [])))
         self.update_plan()
+        self.l_sync.clear()
+        try:
+            self.describe_videos()
+        except Exception as e:   # a video that moved etc. - shown, not fatal
+            self.l_videos.setText(f'<span style="color:#b00">{e}</span>')
 
     def form_to_state(self):
         s = self.state
@@ -407,7 +526,7 @@ class LabApp(QtWidgets.QMainWindow):
                            practice_limb=self.c_plimb.currentText(), practice_side=self.c_pside.currentText(),
                            retest=s['session'] != 'd1')
         try:
-            pattern = [int(x) for x in self.e_pattern.text().replace(' ', '').split(',') if x]
+            pattern = ed.parse_pattern(self.e_pattern.text())
         except ValueError:
             pattern = []
         s['settings'].update(trials_per_sequence=self.s_tps.value(), sequences_per_block=self.s_spb.value(),
@@ -446,6 +565,17 @@ class LabApp(QtWidgets.QMainWindow):
         self.s_offset.setValue(off)
         self.info(f'Offset {off:+.3f} s (match {conf:.1f}x the next best' +
                   (' - unclear, check it' if conf < 1.5 else '') + ')')
+
+    def board_calibration(self):
+        self.form_to_state()
+        if not self.save():
+            return
+        dlg = BoardCalibrationDialog(self, self.state)
+        dlg.exec()
+        if dlg.saved_path:
+            self.e_calib.setText(dlg.saved_path)
+            self.save()
+            self.session = None
 
     def click_calibration(self):
         self.form_to_state()
@@ -1041,6 +1171,149 @@ class LabApp(QtWidgets.QMainWindow):
     def export_all(self):
         path, n = sa.export_all()
         self.l_export.setText(f'Saved ({n} subjects): <a href="file://{path}">{path}</a>')
+
+
+# -----------------------------
+# Board calibration
+# -----------------------------
+class BoardCalibrationDialog(QtWidgets.QDialog):
+    """The printed ChArUco board filmed by both cameras -> lenses + where camera B is (real units, cm)."""
+
+    def __init__(self, parent, state):
+        super().__init__(parent)
+        import calibrate_cameras as cc
+        self.cc, self.state, self.saved_path, self.worker = cc, state, None, None
+        self.setWindowTitle('Board calibration')
+        self.resize(820, 620)
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            f'The ChArUco board ({cc.BOARD_SQUARES[0]} x {cc.BOARD_SQUARES[1]} squares, printed at 100% on A4) held '
+            'where both cameras see it and slowly tilted / moved around the subject\'s area for ~20-30 s.'))
+        self.r_session = QtWidgets.QRadioButton('The session videos')
+        self.r_clips = QtWidgets.QRadioButton('Separate calibration clips (same camera positions)')
+        self.r_session.setChecked(True)
+        f = QtWidgets.QFormLayout()
+        f.addRow(self.r_session)
+        self.s_start = QtWidgets.QDoubleSpinBox()
+        self.s_start.setRange(0, 36000)
+        self.s_start.setSuffix(' s')
+        self.s_len = QtWidgets.QDoubleSpinBox()
+        self.s_len.setRange(5, 36000)
+        self.s_len.setValue(60)
+        self.s_len.setSuffix(' s')
+        tw = QtWidgets.QHBoxLayout()
+        tw.addWidget(QtWidgets.QLabel('look from'))
+        tw.addWidget(self.s_start)
+        tw.addWidget(QtWidgets.QLabel('(video A time) for'))
+        tw.addWidget(self.s_len)
+        tw.addStretch()
+        f.addRow('   Time window', tw)
+        f.addRow(self.r_clips)
+        self.e_ca, self.e_cb = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
+        f.addRow('   Clip camera A', path_row(self.e_ca, lambda: self.browse(self.e_ca)))
+        f.addRow('   Clip camera B', path_row(self.e_cb, lambda: self.browse(self.e_cb)))
+        self.s_off = QtWidgets.QDoubleSpinBox()
+        self.s_off.setRange(-36000, 36000)
+        self.s_off.setDecimals(4)
+        self.s_off.setSuffix(' s')
+        b_tc = QtWidgets.QPushButton('From timecode')
+        b_tc.clicked.connect(self.clip_offset)
+        orow = QtWidgets.QHBoxLayout()
+        orow.addWidget(self.s_off)
+        orow.addWidget(b_tc)
+        orow.addWidget(QtWidgets.QLabel('seconds into clip A at which clip B started'))
+        orow.addStretch()
+        f.addRow('   Clip offset', orow)
+        self.s_sq = QtWidgets.QDoubleSpinBox()
+        self.s_sq.setRange(10, 100)
+        self.s_sq.setDecimals(1)
+        self.s_sq.setValue(cc.BOARD_SQUARE_MM)
+        self.s_sq.setSuffix(' mm')
+        f.addRow('Measured square size', self.s_sq)
+        self.s_ps = QtWidgets.QDoubleSpinBox()
+        self.s_ps.setRange(1, 30)
+        self.s_ps.setValue(4)
+        f.addRow('Frames checked per second', self.s_ps)
+        v.addLayout(f)
+        row = QtWidgets.QHBoxLayout()
+        self.b_run = QtWidgets.QPushButton('Run')
+        self.b_run.setStyleSheet('font-weight:bold; padding:6px 20px;')
+        self.b_run.clicked.connect(self.run)
+        b_stop = QtWidgets.QPushButton('Cancel')
+        b_stop.clicked.connect(self.stop)
+        b_close = QtWidgets.QPushButton('Close')
+        b_close.clicked.connect(self.accept)
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(True)
+        row.addWidget(self.b_run)
+        row.addWidget(b_stop)
+        row.addWidget(self.bar, 1)
+        row.addWidget(b_close)
+        v.addLayout(row)
+        self.out = QtWidgets.QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setStyleSheet('font-family: Menlo, Consolas, monospace;')
+        v.addWidget(self.out, 1)
+
+    def browse(self, edit):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Calibration clip (GoPro: the first chapter)', '',
+                                                     'Videos (*.mov *.mp4 *.MOV *.MP4)')
+        if p:
+            edit.setText(vs.first_chapter(p))
+
+    def clip_offset(self):
+        import timecode
+        try:
+            off, ta, tb = timecode.timecode_offset(self.e_ca.text().strip(), self.e_cb.text().strip())
+            self.s_off.setValue(off)
+            self.out.setPlainText(f"Clip offset from the timecodes: {off:+.4f} s (A {ta['timecode']}, B {tb['timecode']})")
+        except Exception as e:
+            self.out.setPlainText(f'Could not read the timecodes: {e}')
+
+    def run(self):
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if self.r_session.isChecked():
+            a, b, off = self.state['cam_a'], self.state.get('cam_b'), self.state.get('offset_s', 0.0)
+            start, length = self.s_start.value(), self.s_len.value()
+        else:
+            a, b, off = self.e_ca.text().strip(), self.e_cb.text().strip(), self.s_off.value()
+            start, length = 0.0, 0.0
+        if not (a and b and os.path.exists(a) and os.path.exists(b)):
+            self.out.setPlainText('Choose both videos first (Session step, or the clips here).')
+            return
+        sq, ps = self.s_sq.value(), self.s_ps.value()
+        self.out.setPlainText(f'Looking for the board in {os.path.basename(a)} and {os.path.basename(b)} '
+                              f'(offset {off:+.4f} s)...')
+
+        def job(progress, stop):
+            return self.cc.calibrate_board(a, b, off, sq, start, length, ps, progress=progress, should_stop=stop)
+
+        def done(res):
+            path = os.path.join(sa.session_dir(self.state), 'cameras_board.json')
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.cc.save_board_calibration(path, res, a, b)
+            self.saved_path = path
+            self.out.setPlainText(self.cc.board_report(res) + f'\n\nSaved: {path}\nand set as this session\'s '
+                                  'calibration.')
+            self.bar.setValue(1000)
+            self.bar.setFormat('done - PASS' if res['ok'] else 'done - with warnings')
+
+        self.worker = Worker(job)
+        self.worker.progress.connect(lambda f, t: (self.bar.setValue(int(f * 1000)), self.bar.setFormat(f'{f:.0%}  {t}')))
+        self.worker.done.connect(done)
+        self.worker.failed.connect(lambda m: (self.out.setPlainText(f'Calibration failed:\n{m}'),
+                                              self.bar.setFormat('failed')))
+        self.worker.start()
+
+    def stop(self):
+        if self.worker is not None:
+            self.worker.stop_requested = True
+
+    def reject(self):
+        self.stop()
+        super().reject()
 
 
 # -----------------------------
