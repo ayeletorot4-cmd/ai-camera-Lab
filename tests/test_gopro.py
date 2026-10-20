@@ -326,5 +326,38 @@ class OffsetEverywhere(unittest.TestCase):
         self.assertAlmostEqual(s.times[ev[1][1]], 30000, delta=1000 / fps)   # beyond A's end: still placed right
 
 
+class BoardPrint(unittest.TestCase):
+    def _check(self, img):
+        import calibrate_cameras as cc
+        board, det = cc.make_board()
+        xyz = board.getChessboardCorners().reshape(-1, 3)
+        px = img.shape[0] / 297.0
+        c, ids, _, _ = det.detectBoard(img)
+        self.assertEqual(len(ids), 24)                       # (5-1) x (7-1) ChArUco corners
+        c, ids = c.reshape(-1, 2), ids.ravel()
+        d = [np.linalg.norm(c[i] - c[j]) / px for i in range(len(ids)) for j in range(len(ids))
+             if ids[j] > ids[i] and abs(np.linalg.norm(xyz[ids[i]] - xyz[ids[j]]) - cc.BOARD_SQUARE_MM) < 1e-6]
+        self.assertAlmostEqual(np.mean(d), cc.BOARD_SQUARE_MM, delta=0.1)
+
+    def test_png_and_pdf(self):
+        import shutil
+        import subprocess
+        import cv2
+        import calibrate_cameras as cc
+        d = tempfile.mkdtemp()
+        png, pdf = os.path.join(d, 'b.png'), os.path.join(d, 'b.pdf')
+        cc.write_board_png(png)
+        self._check(cv2.imread(png, cv2.IMREAD_GRAYSCALE))
+        cc.write_board_pdf(pdf)
+        with open(pdf, 'rb') as f:
+            head = f.read(2000)
+        self.assertIn(b'/MediaBox [0 0 595.2756 841.8898]', head)    # exactly A4
+        if shutil.which('sips') is None:
+            self.skipTest('no PDF renderer (macOS sips) here')
+        out = os.path.join(d, 'pdf.png')
+        subprocess.run(['sips', '-s', 'format', 'png', '-Z', '3508', pdf, '--out', out], check=True, capture_output=True)
+        self._check(cv2.imread(out, cv2.IMREAD_GRAYSCALE))
+
+
 if __name__ == '__main__':
     unittest.main()

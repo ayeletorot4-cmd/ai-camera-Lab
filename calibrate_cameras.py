@@ -281,22 +281,94 @@ def make_board():
     return board, cv2.aruco.CharucoDetector(board)
 
 
-def run_make_board(args):
+A4_MM = (210.0, 297.0)
+BOARD_TEXT = f'Print at 100% / Actual size \u2014 each square must measure {BOARD_SQUARE_MM:.0f} mm'
+CHECK_BAR_MM = 100.0
+
+
+def _layout():
+    """Board, text and check bar positions on the A4 page (mm from the top-left corner)."""
+    bw, bh = BOARD_SQUARES[0] * BOARD_SQUARE_MM, BOARD_SQUARES[1] * BOARD_SQUARE_MM
+    x0, y0 = (A4_MM[0] - bw) / 2, (A4_MM[1] - bh) / 2
+    return dict(board=(x0, y0, bw, bh), text_y=y0 / 2 + 1.5, bar=(x0, y0 + bh + (A4_MM[1] - y0 - bh) / 2, CHECK_BAR_MM))
+
+
+def board_image(px_per_square):
     board, _ = make_board()
-    dpi = 300
-    px_per_mm = dpi / 25.4
-    a4 = (int(210 * px_per_mm), int(297 * px_per_mm))
-    bw, bh = int(BOARD_SQUARES[0] * BOARD_SQUARE_MM * px_per_mm), int(BOARD_SQUARES[1] * BOARD_SQUARE_MM * px_per_mm)
-    img = board.generateImage((bw, bh), marginSize=0)
-    page = np.full((a4[1], a4[0]), 255, np.uint8)
-    y0, x0 = (a4[1] - bh) // 2, (a4[0] - bw) // 2
-    page[y0:y0 + bh, x0:x0 + bw] = img
-    cv2.putText(page, f'Print at 100% (no "fit to page"). Each square must measure {BOARD_SQUARE_MM:.0f} mm.',
-                (60, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, 0, 2)
-    path = os.path.join(OUT_DIR, 'charuco_board.png')
-    os.makedirs(OUT_DIR, exist_ok=True)
+    return board.generateImage((BOARD_SQUARES[0] * px_per_square, BOARD_SQUARES[1] * px_per_square), marginSize=0)
+
+
+def write_board_png(path, dpi=300):
+    px = dpi / 25.4
+    lay = _layout()
+    page = np.full((int(round(A4_MM[1] * px)), int(round(A4_MM[0] * px))), 255, np.uint8)
+    x0, y0, bw, bh = lay['board']
+    img = board_image(int(round(BOARD_SQUARE_MM * px)))
+    X, Y = int(round(x0 * px)), int(round(y0 * px))
+    page[Y:Y + img.shape[0], X:X + img.shape[1]] = img
+    cv2.putText(page, BOARD_TEXT.replace('\u2014', '-'), (X, int(lay['text_y'] * px)), cv2.FONT_HERSHEY_SIMPLEX,
+                1.0, 0, 2, cv2.LINE_AA)
+    bx, by, blen = lay['bar']
+    x1, x2, yb = int(round(bx * px)), int(round((bx + blen) * px)), int(round(by * px))
+    cv2.rectangle(page, (x1, yb - int(0.6 * px)), (x2, yb + int(0.6 * px)), 0, -1)
+    for k in range(11):
+        xt = int(round((bx + 10 * k) * px))
+        cv2.line(page, (xt, yb - int((2.5 if k % 5 == 0 else 1.5) * px)), (xt, yb), 0, 2)
+    cv2.putText(page, f'{CHECK_BAR_MM:.0f} mm check bar', (x2 + int(3 * px), yb + int(1 * px)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, 0, 2, cv2.LINE_AA)
     cv2.imwrite(path, page, [cv2.IMWRITE_PNG_COMPRESSION, 9])
-    print(f'Saved: {path} (A4, {dpi} dpi)')
+
+
+def write_board_pdf(path, px_per_mm=20):
+    """One A4 page (595.276 x 841.890 pt): the board as an exact-size image, the text and a 100 mm check bar
+    as vector lines - printed at 100% / actual size, every square measures BOARD_SQUARE_MM."""
+    import zlib
+    pt = 72 / 25.4
+    W, H = A4_MM[0] * pt, A4_MM[1] * pt
+    lay = _layout()
+    x0, y0, bw, bh = lay['board']
+    img = board_image(int(round(BOARD_SQUARE_MM * px_per_mm)))   # 760 px per square: whole pixels per marker cell
+    data = zlib.compress(img.tobytes(), 9)
+    bx, by, blen = lay['bar']
+    yb = H - by * pt
+    ops = [f'1 g 0 0 {W:.4f} {H:.4f} re f',                     # white page (not transparent)
+           f'q {bw * pt:.4f} 0 0 {bh * pt:.4f} {x0 * pt:.4f} {H - (y0 + bh) * pt:.4f} cm /Im1 Do Q',
+           f'0 g {bx * pt:.4f} {yb - 0.6 * pt:.4f} {blen * pt:.4f} {1.2 * pt:.4f} re f', '0 G 0.6 w']
+    for k in range(11):
+        xt = (bx + 10 * k) * pt
+        ops.append(f'{xt:.4f} {yb:.4f} m {xt:.4f} {yb + (2.5 if k % 5 == 0 else 1.5) * pt:.4f} l S')
+    text = BOARD_TEXT.replace('\u2014', '\\227')            # em dash in WinAnsiEncoding
+    ops.append(f'BT /F1 11 Tf {x0 * pt:.4f} {H - lay["text_y"] * pt:.4f} Td ({text}) Tj ET')
+    ops.append(f'BT /F1 9 Tf {(bx + blen) * pt + 8:.4f} {yb - 3:.4f} Td ({CHECK_BAR_MM:.0f} mm check bar) Tj ET')
+    content = '\n'.join(ops).encode('latin-1')
+    objs = [b'<< /Type /Catalog /Pages 2 0 R >>',
+            b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            (f'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {W:.4f} {H:.4f}] /Contents 4 0 R '
+             f'/Resources << /XObject << /Im1 5 0 R >> /Font << /F1 6 0 R >> >> >>').encode(),
+            f'<< /Length {len(content)} >>\nstream\n'.encode() + content + b'\nendstream',
+            (f'<< /Type /XObject /Subtype /Image /Width {img.shape[1]} /Height {img.shape[0]} /ColorSpace /DeviceGray '
+             f'/BitsPerComponent 8 /Interpolate false /Filter /FlateDecode /Length {len(data)} >>\nstream\n').encode()
+            + data + b'\nendstream',
+            b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>']
+    out = bytearray(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n')
+    offsets = []
+    for i, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f'{i} 0 obj\n'.encode() + o + b'\nendobj\n'
+    xref = len(out)
+    out += f'xref\n0 {len(objs) + 1}\n0000000000 65535 f \n'.encode()
+    out += b''.join(f'{o:010d} 00000 n \n'.encode() for o in offsets)
+    out += f'trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode()
+    with open(path, 'wb') as f:
+        f.write(out)
+
+
+def run_make_board(args):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    png, pdf = os.path.join(OUT_DIR, 'charuco_board.png'), os.path.join(OUT_DIR, 'charuco_board.pdf')
+    write_board_png(png)
+    write_board_pdf(pdf)
+    print(f'Saved: {pdf} (A4, exact scale - print at 100% / Actual size)\n       {png} (A4, 300 dpi)')
 
 
 def detect_board(detector, frame, min_corners=6):
