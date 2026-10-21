@@ -457,8 +457,10 @@ class LabApp(QtWidgets.QMainWindow):
                             f'→ offset {off:+.4f} s. Checking against the sound…')
         self.form_to_state()
         self.save()
-        if sys.platform != 'darwin':
-            self.l_sync.setText(self.l_sync.text().replace('Checking against the sound…', '(sound check needs macOS)'))
+        import sync_videos
+        if sync_videos.audio_tool() is None:
+            self.l_sync.setText(self.l_sync.text().replace('Checking against the sound…',
+                                                           '(sound check needs ffmpeg or macOS)'))
             return
 
         def job(progress, stop):
@@ -568,10 +570,10 @@ class LabApp(QtWidgets.QMainWindow):
         if not (self.state['cam_a'] and self.state['cam_b']):
             self.error('Choose both videos first.')
             return
-        if sys.platform != 'darwin':
-            self.error('Finding the offset from the sound needs macOS - type the offset in.')
-            return
         import sync_videos
+        if sync_videos.audio_tool() is None:
+            self.error(sync_videos.NO_AUDIO_TOOL)
+            return
         try:
             off, conf = sync_videos.audio_offset(self.state['cam_a'], self.state['cam_b'])
         except Exception as e:

@@ -1,6 +1,7 @@
 """Cut two videos of the same session (two cameras recording together) so they are frame-by-frame in sync.
 
-The time offset between the videos is found by cross-correlating their sound tracks (macOS: afconvert), or given
+The time offset between the videos is found by cross-correlating their sound tracks (macOS afconvert, or FFmpeg's
+ffmpeg on any system), or given
 with --offset. Both outputs cover only the time both cameras recorded and have the same number of frames:
 frame i of one output was taken at the same moment as frame i of the other (to within half a frame, ~8 ms at 60 fps).
 Each frame of the second video is the one whose timestamp is closest to the first video's frame, so a small
@@ -14,6 +15,7 @@ For cameras that record with a shared timecode (e.g. two synced GoPros) this ste
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,17 +28,38 @@ from scipy.signal import correlate
 from video_source import open_video_writer
 
 AUDIO_RATE = 16000
+NO_AUDIO_TOOL = ('Reading the sound needs ffmpeg (FFmpeg; on Windows download it from https://ffmpeg.org/download.html '
+                 'and add its bin folder to PATH) - or macOS. Otherwise type the offset in.')
+
+
+def audio_tool():
+    """The program that extracts the sound track: 'afconvert' (macOS), 'ffmpeg' (if installed) or None."""
+    for name in ('afconvert', 'ffmpeg'):
+        if shutil.which(name):
+            return name
+    return None
+
+
+def _to_wav(tool, video, wav):
+    if tool == 'afconvert':
+        cmd = ['afconvert', '-f', 'WAVE', '-d', f'LEI16@{AUDIO_RATE}', '-c', '1', video, wav]
+    else:
+        cmd = [shutil.which('ffmpeg'), '-v', 'error', '-y', '-i', video, '-vn', '-ac', '1', '-ar', str(AUDIO_RATE),
+               '-c:a', 'pcm_s16le', wav]
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 def read_audio(video_path, tmp_dir, max_s=600):
     """Mono sound track of the video (its GoPro chapters one after the other) at AUDIO_RATE, at most max_s
-    seconds (needs macOS afconvert)."""
+    seconds (macOS afconvert, else ffmpeg)."""
     import video_source as vs
+    tool = audio_tool()
+    if tool is None:
+        raise RuntimeError(NO_AUDIO_TOOL)
     parts, total = [], 0
     for k, p in enumerate(vs.chapters(video_path)):
         wav = os.path.join(tmp_dir, f'{k}_{os.path.basename(p)}.wav')
-        subprocess.run(['afconvert', '-f', 'WAVE', '-d', f'LEI16@{AUDIO_RATE}', '-c', '1', p, wav],
-                       check=True, capture_output=True)
+        _to_wav(tool, p, wav)
         _, x = wavfile.read(wav)
         parts.append(x.astype(np.float64))
         total += len(x)
@@ -78,8 +101,8 @@ def main():
     args = parser.parse_args()
 
     if args.offset is None:
-        if sys.platform != 'darwin':
-            sys.exit('Finding the offset from the sound needs macOS (afconvert) - give it with --offset.')
+        if audio_tool() is None:
+            sys.exit(NO_AUDIO_TOOL.replace('type the offset in', 'give it with --offset'))
         offset, confidence = audio_offset(args.video_a, args.video_b)
         print(f'Offset from the sound: video B starts {offset:+.4f} s into video A '
               f'(peak {confidence:.1f}x the next best match)')
