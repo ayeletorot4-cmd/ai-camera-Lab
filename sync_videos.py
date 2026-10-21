@@ -23,6 +23,8 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.signal import correlate
 
+from video_source import open_video_writer
+
 AUDIO_RATE = 16000
 
 
@@ -55,15 +57,6 @@ def audio_offset(path_a, path_b, max_s=600):
     far = c.copy()
     far[max(0, peak - AUDIO_RATE // 2):peak + AUDIO_RATE // 2] = 0
     return (peak - (len(b) - 1)) / AUDIO_RATE, float(c[peak] / max(far.max(), 1e-9))
-
-
-def open_video_writer(path, fps, size):
-    """MP4 writer: H.264 (plays everywhere, also in browsers) if this OpenCV build has it, else MPEG-4 Part 2."""
-    for fourcc in ('avc1', 'mp4v'):
-        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, size)
-        if writer.isOpened():
-            return writer
-    return writer
 
 
 def frame_times(path):

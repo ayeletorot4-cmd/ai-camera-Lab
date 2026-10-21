@@ -229,6 +229,15 @@ class VideoSource:
         return out
 
 
+def open_video_writer(path, fps, size):
+    """MP4 writer: H.264 (plays everywhere, also in browsers) if this OpenCV build has it, else MPEG-4 Part 2."""
+    for fourcc in ('avc1', 'mp4v'):
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, size)
+        if writer.isOpened():
+            return writer
+    return writer
+
+
 def read_frame(path, index):
     """One frame by its (global) frame number - exact (FFmpeg decoder, not the hardware one)."""
     src = VideoSource(path, hardware=False)
