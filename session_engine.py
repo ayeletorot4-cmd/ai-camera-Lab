@@ -17,20 +17,19 @@ import multiprocessing as mproc
 import os
 import queue
 import threading
-import sys
 import time
 
 import cv2
 import numpy as np
 
+import extract_kinematics as ek
 import video_source as vs
 
 MP_MAX_SIDE = 1280        # frames are shrunk to this before MediaPipe (its models work on ~256 px crops)
 MOTION_EVERY = 10         # camera movement is measured every 10th frame (it changes slowly)
-TOUCH_POINTS = {          # pose points that can touch a switch (both sides)
-    'upper': [15, 16, 17, 18, 19, 20, 21, 22],   # wrists, pinky, index, thumb
-    'lower': [27, 28, 29, 30, 31, 32],           # ankles, heels, toes
-}
+# Pose points that can touch a switch, both sides: wrists, pinky, index, thumb / ankles, heels, toes
+TOUCH_POINTS = {limb: sorted(i for side in ('left', 'right') for i in ek.LIMBS[limb]['touch_points'][side])
+                for limb in ('upper', 'lower')}
 
 
 def open_video(path, threads=0):
@@ -133,14 +132,18 @@ def load_cache(video_path, out_dir, boxes=None):
         return None
     if not meta.get('complete'):   # older caches used a too strict test: check against the video's length
         src = vs.VideoSource(video_path, hardware=False)
-        meta['complete'] = meta['frames'] >= src.total_frames - max(2, meta['fps']) * len(src.paths)
+        meta['complete'] = _complete(meta['frames'], src, meta['fps'])
     d['meta'] = meta
     return d
 
 
+def _complete(frames, src, fps):
+    """All frames there? (a chapter's frame count can be a little off: up to 1 s per chapter is allowed)"""
+    return frames >= src.total_frames - max(2, fps) * len(src.paths)
+
+
 def _process_range(job):
     """Worker: frames [start, end) of the video -> per-frame arrays (saved to a temporary .npz)."""
-    import extract_kinematics as ek
     import mediapipe as mp
     video_path, boxes, t_start, t_end, out_file, counter = job[:6]   # this part: frames with t_start <= ms < t_end
     threads = job[6] if len(job) > 6 else 0
@@ -154,9 +157,7 @@ def _process_range(job):
         cap.set(cv2.CAP_PROP_POS_MSEC, t_start - 1000)
     scale = min(1.0, MP_MAX_SIDE / max(w, h))
     n_sw = len(boxes)
-    light_corners = [ek.box_corners(b, w, h, ek.LIGHT_BOX_MARGIN) for b in boxes]
-    touch_corners = [ek.box_corners(b, w, h, 0.0) for b in boxes]
-    sizes = np.array([np.sqrt((b[2] - b[0]) * w * (b[3] - b[1]) * h) for b in boxes])
+    light_corners, touch_corners, sizes = ek.switch_geometry(boxes, w, h)
     times, pose, motion, light, tu, tl = [], [], [], [], [], []
     frames = _Prefetch(cap, t_start, t_end, scale)
     try:
@@ -178,10 +179,8 @@ def _process_range(job):
                 for s in range(n_sw):
                     lv[s] = ek.light_energy(frame, camera.apply(light_corners[s]))
                     poly = camera.apply(touch_corners[s]).astype(np.float32)
-                    for key, out in (('upper', du), ('lower', dl)):
-                        if pts[key]:
-                            out[s] = min(-cv2.pointPolygonTest(poly, (float(x), float(y)), True)
-                                         for x, y in pts[key]) / sizes[s]
+                    du[s] = ek.touch_distance(poly, pts['upper'], sizes[s])
+                    dl[s] = ek.touch_distance(poly, pts['lower'], sizes[s])
                 light.append(lv)
                 tu.append(du)
                 tl.append(dl)
@@ -259,7 +258,7 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     d['light'], d['touch_upper'], d['touch_lower'] = d['light'].T, d['touch_upper'].T, d['touch_lower'].T
     meta = dict(video=os.path.abspath(video_path), video_size=vs.total_size(video_path), fps=fps, size=size,
                 chapters=[os.path.basename(p) for p in src.paths],
-                boxes=boxes, frames=len(d['times']), complete=len(d['times']) >= total - max(2, fps) * len(src.paths),
+                boxes=boxes, frames=len(d['times']), complete=_complete(len(d['times']), src, fps),
                 seconds=round(time.time() - t0, 1), workers=workers, decoder='+'.join(decoders))
     np.savez_compressed(cache_path(video_path, out_dir), meta=json.dumps(meta), **d)
     d['meta'] = meta

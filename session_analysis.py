@@ -14,10 +14,10 @@ import json
 import os
 from dataclasses import asdict
 
-import cv2
 import numpy as np
 
 import experiment_design as ed
+import extract_kinematics as ek
 import session_engine as se
 import trial_measures as tm
 
@@ -64,15 +64,6 @@ def settings_of(state):
 
 def trial_key(r):
     return f"{r['Part']}|{r['Block']}|{r['Sequence']}|{r['Trial']}"
-
-
-def _first_frame_xy(cache, pts, frames):
-    """Points (frames, 2) of a camera -> that camera's first-frame coordinates (camera movement removed)."""
-    M = cache['motion'][np.asarray(list(frames))].astype(float)        # (n, 2, 3): first frame -> frame
-    A, t = M[:, :, :2], M[:, :, 2]
-    det = A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0]
-    inv = np.stack([np.stack([A[:, 1, 1], -A[:, 0, 1]], -1), np.stack([-A[:, 1, 0], A[:, 0, 0]], -1)], 1) / det[:, None, None]
-    return np.einsum('nij,nj->ni', inv, np.asarray(pts, float) - t)
 
 
 def _nearest(ref_times, query, tol):
@@ -149,7 +140,7 @@ class Session:
         """Marker of camera c on the session timeline, in that camera's first-frame image coordinates."""
         cache = self.cams[c]
         xy = tm.marker_track(cache['pose'], *key, cache['meta']['size'])
-        xy = _first_frame_xy(cache, xy, range(len(xy)))
+        xy = ek.to_first_frame(xy, cache['motion'][:len(xy)])
         return self.per_frame(c, xy)
 
     def analyze(self):
@@ -185,7 +176,7 @@ class Session:
             w, h = cache['meta']['size']
             boxes = np.array(st[f'boxes_{c}'])
             centers = np.column_stack([(boxes[:, 0] + boxes[:, 2]) / 2 * w, (boxes[:, 1] + boxes[:, 3]) / 2 * h])
-            sizes = np.sqrt((boxes[:, 2] - boxes[:, 0]) * w * (boxes[:, 3] - boxes[:, 1]) * h)
+            sizes = np.array([ek.box_size(b, w, h) for b in boxes])
             sources.append(dict(name=f'camera {c.upper()}', cam=c, switch_pos=centers, switch_size=sizes,
                                 track={k: self.track_2d(c, k) for k in keys}))
         if self.two_cameras:

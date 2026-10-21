@@ -18,6 +18,8 @@ import argparse
 import json
 from datetime import datetime
 
+from video_source import open_video_writer  # noqa: F401 (also used by analyze_two_views.py)
+
 WINDOW_NAME = 'MediaPipe Kinematics Visualization'
 
 # -----------------------------
@@ -83,15 +85,6 @@ def fit_to_screen(frame_w, frame_h, screen_w, screen_h, margin=0.9):
     """Largest size that keeps the aspect ratio and fits inside the screen (leaves room for the title bar)."""
     scale = min(screen_w * margin / frame_w, (screen_h - 40) * margin / frame_h, 1.0)
     return int(frame_w * scale), int(frame_h * scale)
-
-
-def open_video_writer(path, fps, size):
-    """MP4 writer: H.264 (plays everywhere, also in browsers) if this OpenCV build has it, else MPEG-4 Part 2."""
-    for fourcc in ('avc1', 'mp4v'):
-        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, size)
-        if writer.isOpened():
-            return writer
-    return writer
 
 
 def default_output_path(video_path, suffix, ext):
@@ -201,11 +194,20 @@ def _fill_holes(mask):
     return out
 
 
+def _pink(img):
+    """(mask of the pixels lit by a switch's pink LED, R - max(G, B) per pixel) of an 8-bit BGR image.
+
+    Lit LED/glow pixels are bright pink: red near saturation, green and blue clearly lower but still high, blue
+    not below green. On the 8-bit channels (no wider copy - this runs 5 times per 4K frame): R - max(G, B) and
+    G - B saturate at 0, which changes nothing for the pink pixels (excess > 20, B >= G - 15 <=> G - B <= 15)."""
+    B, G, R = cv2.split(img)
+    excess = cv2.subtract(R, cv2.max(G, B))
+    return (R > 200) & (G > 90) & (cv2.subtract(G, B) <= 15) & (excess > 20), excess
+
+
 def pink_mask(frame):
     """Pixels lit by a switch's pink LED (same colour test as light_energy)."""
-    p = frame.astype(np.int16)
-    B, G, R = p[..., 0], p[..., 1], p[..., 2]
-    return (R > 200) & (G > 90) & (B >= G - 15) & (R - np.maximum(G, B) > 20)
+    return _pink(frame)[0]
 
 
 def scan_video(cap, first_frame, total_frames, fps, show, start_frame=0, max_frames=None, should_stop=None):
@@ -412,6 +414,46 @@ def box_corners(box, frame_w, frame_h, margin):
     return np.float32([[x0 - mx, y0 - my], [x1 + mx, y0 - my], [x1 + mx, y1 + my], [x0 - mx, y1 + my]])
 
 
+def box_size(box, frame_w, frame_h):
+    """Size of a fractional switch box in pixels (square root of its area): the unit of touch distances."""
+    return float(np.sqrt((box[2] - box[0]) * frame_w * (box[3] - box[1]) * frame_h))
+
+
+def switch_geometry(boxes, frame_w, frame_h):
+    """Per switch box, in first-frame pixels: the corners where its light is measured (enlarged by
+    LIGHT_BOX_MARGIN), the corners touching is measured against, and its size."""
+    return ([box_corners(b, frame_w, frame_h, LIGHT_BOX_MARGIN) for b in boxes],
+            [box_corners(b, frame_w, frame_h, 0.0) for b in boxes],
+            np.array([box_size(b, frame_w, frame_h) for b in boxes]))
+
+
+def touch_distance(poly, points, size):
+    """Distance of the closest point (x, y) to the polygon (negative = inside), in box sizes; inf if no points."""
+    return min((-cv2.pointPolygonTest(poly, (float(x), float(y)), True) for x, y in points),
+               default=np.inf) / size
+
+
+def to_frame(pts, M):
+    """First-frame points (..., 2) -> a frame's coordinates (M: the camera movement, first frame -> that frame)."""
+    return np.asarray(pts) @ M[:, :2].T + M[:, 2]
+
+
+def to_first_frame(pts, M):
+    """A frame's points -> first-frame coordinates (the camera movement undone). M: (2, 3) with points (..., 2),
+    or one matrix per frame (n, 2, 3) with points (n, 2) or (n, k, 2)."""
+    M = np.asarray(M, float)
+    A, t = M[..., :2], M[..., 2]
+    det = A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0]
+    inv = np.stack([np.stack([A[..., 1, 1], -A[..., 0, 1]], -1), np.stack([-A[..., 1, 0], A[..., 0, 0]], -1)], -2)
+    inv = inv / det[..., None, None]
+    pts = np.asarray(pts, float)
+    if M.ndim == 2:
+        return (pts - t) @ inv.T
+    if pts.ndim == 2:
+        return np.einsum('nij,nj->ni', inv, pts - t)
+    return np.einsum('nij,nkj->nki', inv, pts - t[:, None])
+
+
 class CameraMotion:
     """Follows small camera movements: maps first-frame coordinates to the current frame.
 
@@ -449,19 +491,14 @@ class CameraMotion:
 def light_energy(frame, corners):
     """Amount of pink LED light (the LED and its glow) inside the polygon's bounding box, per pixel.
 
-    Lit LED/glow pixels are bright pink: red near saturation, green and blue clearly lower but still
-    high, blue not below green. This leaves out the deep-red mushroom button (low green/blue), the
-    white table (R = G = B) and skin (orange: blue well below green), which all sit in or near the box."""
+    The pink test (_pink) leaves out the deep-red mushroom button (low green/blue), the white table (R = G = B)
+    and skin (orange: blue well below green), which all sit in or near the box."""
     h, w = frame.shape[:2]
     x0, y0 = np.clip(np.floor(corners.min(axis=0)).astype(int), 0, [w, h])
     x1, y1 = np.clip(np.ceil(corners.max(axis=0)).astype(int), 0, [w, h])
     if x1 - x0 < 2 or y1 - y0 < 2:
         return 0.0
-    # On the 8-bit channels (no int32 copy of the patch - this runs 5 times per 4K frame): R - max(G, B) and
-    # G - B saturate at 0, which changes nothing for the pink pixels (excess > 20, B >= G - 15 <=> G - B <= 15)
-    B, G, R = cv2.split(frame[y0:y1, x0:x1])
-    excess = cv2.subtract(R, cv2.max(G, B))
-    pink = (R > 200) & (G > 90) & (cv2.subtract(G, B) <= 15) & (excess > 20)
+    pink, excess = _pink(frame[y0:y1, x0:x1])
     return float(excess[pink].sum(dtype=np.int64)) * 100 / ((x1 - x0) * (y1 - y0))
 
 
@@ -637,9 +674,7 @@ def main():
                 print("Switch marking cancelled - continuing without switch events.")
         if switch_boxes:
             camera = CameraMotion(first_frame)
-            light_corners = [box_corners(b, frame_w, frame_h, LIGHT_BOX_MARGIN) for b in switch_boxes]
-            touch_corners = [box_corners(b, frame_w, frame_h, 0.0) for b in switch_boxes]
-            touch_sizes = [float(np.sqrt((b[2] - b[0]) * frame_w * (b[3] - b[1]) * frame_h)) for b in switch_boxes]
+            light_corners, touch_corners, touch_sizes = switch_geometry(switch_boxes, frame_w, frame_h)
             events_csv_path = default_output_path(input_video_path, f'{tag}_switch_events', '.csv')
     # Touch detection also uses the hand-only model: Holistic finds hands only through the body pose, so it
     # misses them when the body is mostly outside the frame (e.g. only the arm reaches in)
@@ -743,9 +778,7 @@ def main():
                     for s in range(len(switch_boxes)):
                         light_signal[s].append(light_energy(frame, camera.apply(light_corners[s])))
                         # Distance of the closest point outside the box (negative = inside), in box sizes
-                        poly = camera.apply(touch_corners[s])
-                        dist = min((-cv2.pointPolygonTest(poly, (float(x), float(y)), True) for x, y in touch_pts),
-                                   default=np.inf) / touch_sizes[s]
+                        dist = touch_distance(camera.apply(touch_corners[s]), touch_pts, touch_sizes[s])
                         touching[s].append(dist)
                         cur_touch.append(dist <= TOUCH_DIST)
 
@@ -804,12 +837,33 @@ def main():
         write_switch_events(events_csv_path, light_signal, touching, frame_times, fps)
 
 
+def touch_search_end(events, k, n, fps):
+    """End (exclusive) of the frames searched for light event k's touch: TOUCH_AFTER_OFF_S after the light
+    turned off (pressing turns it off), but not into the next event. events: (on, off) frames, off None = on."""
+    off = events[k][1]
+    end = n if off is None else min(n, off + int(round(TOUCH_AFTER_OFF_S * fps)))
+    return min(end, events[k + 1][0]) if k + 1 < len(events) else end
+
+
+def event_row(s, on, touch, off, frame_times):
+    """A switch-events CSV row: switch number, light start, first touch, light off (ms; '' = unknown)."""
+    ms = lambda f: round(float(frame_times[f]), 1)
+    return [s + 1, ms(on) if on > 0 else '', ms(touch) if touch is not None else '', ms(off) if off is not None else '']
+
+
+def write_events_csv(path, rows):
+    rows.sort(key=lambda r: (r[0], r[1] if r[1] != '' else -1))
+    with open(path, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Switch', 'Start_ms', 'Touching_ms', 'Turn_off_ms'])
+        writer.writerows(rows)
+
+
 def write_switch_events(path, light_signal, touching, frame_times, fps):
     """One row per light event: switch number, light start, first touch, light off (ms, video time).
 
     Empty cell = unknown: start of a light already on when the video begins, off of a light still on
     when it ends, or no touch found. A switch with no light events gets one row with only its number."""
-    touch_window = int(round(TOUCH_AFTER_OFF_S * fps))
     rows = []
     print("\nSwitch events:")
     for s in range(len(light_signal)):
@@ -822,18 +876,10 @@ def write_switch_events(path, light_signal, touching, frame_times, fps):
         n = len(frame_times)
         for k, (on, off) in enumerate(events):
             # Touch search: from light start until 1 s after it turns off (but not into the next event)
-            end = n if off is None else min(n, off + touch_window)
-            if k + 1 < len(events):
-                end = min(end, events[k + 1][0])
+            end = touch_search_end(events, k, n, fps)
             touch = next((f for f in range(on, end) if touching[s][f] <= TOUCH_DIST), None)
-            rows.append([s + 1, round(frame_times[on], 1) if on > 0 else '',
-                         round(frame_times[touch], 1) if touch is not None else '',
-                         round(frame_times[off], 1) if off is not None else ''])
-    rows.sort(key=lambda r: (r[0], r[1] if r[1] != '' else -1))
-    with open(path, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Switch', 'Start_ms', 'Touching_ms', 'Turn_off_ms'])
-        writer.writerows(rows)
+            rows.append(event_row(s, on, touch, off, frame_times))
+    write_events_csv(path, rows)
     print(f"Switch events saved to {path}")
 
 

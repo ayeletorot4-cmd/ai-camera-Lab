@@ -71,9 +71,11 @@ def light_events(light, fps):
     return sorted(events, key=lambda e: e[1])
 
 
-def merge_camera_events(ev_a, ev_b, fps, max_gap_s=0.2):
+def merge_camera_events(ev_a, ev_b, fps, max_gap_s=0.2, off_unknown_wins=False):
     """Events of the same switches seen by two cameras (frames on camera A's clock) -> one list. Seen by
-    both: earliest on, latest off (a hand over the LED can only make a light look off in one view)."""
+    both: earliest on, latest off (a hand over the LED can only make a light look off in one view).
+    off_unknown_wins: a light still on at the end in one view (off None) stays None (videos that end together,
+    analyze_two_views.py); else the other camera's off is used (one camera may stop earlier)."""
     out, used = [], set()
     for s, on, off in ev_a:
         k = next((i for i, (s2, on2, _) in enumerate(ev_b)
@@ -86,7 +88,7 @@ def merge_camera_events(ev_a, ev_b, fps, max_gap_s=0.2):
         on_m = min(on, on2) if on > 0 and on2 > 0 else max(on, on2)
         # off None = still on when that camera's video ended: the other camera knows (unless it ended too)
         offs = [o for o in (off, off2) if o is not None]
-        off_m = max(offs) if offs else None
+        off_m = max(offs) if offs and (len(offs) == 2 or not off_unknown_wins) else None
         out.append((s, on_m, off_m))
     out += [e for i, e in enumerate(ev_b) if i not in used]
     return sorted(out, key=lambda e: e[1])

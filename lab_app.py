@@ -22,6 +22,7 @@ import experiment_design as ed  # noqa: E402
 import extract_kinematics as ek  # noqa: E402
 import session_analysis as sa  # noqa: E402
 import session_engine as se  # noqa: E402
+import trial_measures as tm  # noqa: E402
 import video_source as vs  # noqa: E402
 
 PART_CHOICES = [ed.IGNORE] + ed.PART_ORDER
@@ -1128,7 +1129,7 @@ class LabApp(QtWidgets.QMainWindow):
             return
         cache = self.session.cams[cam]
         # Marker and target
-        j = {'upper': {'right': 16, 'left': 15}, 'lower': {'right': 28, 'left': 27}}[r['Limb']][r['Side']]
+        j = tm.MARKER[r['Limb']][r['Side']]
         p = cache['pose'][cf, j]
         sc = max(frame.shape[:2]) / 1280
         if not np.isnan(p[0]):
@@ -1136,7 +1137,7 @@ class LabApp(QtWidgets.QMainWindow):
         w, h = cache['meta']['size']
         b = self.state[f'boxes_{cam}'][r['Target'] - 1]
         M = cache['motion'][cf]
-        c = ek.box_corners(b, w, h, 0.0) @ M[:, :2].T + M[:, 2]
+        c = ek.to_frame(ek.box_corners(b, w, h, 0.0), M)
         cv2.polylines(frame, [c.astype(np.int32)], True, (0, 212, 255), int(3 * sc))
         which = f'camera {cam.upper()}: {which}'
         cv2.putText(frame, f'{which}  {mmss(times[f])}', (int(20 * sc), int(50 * sc)), cv2.FONT_HERSHEY_SIMPLEX,
@@ -1443,12 +1444,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.redraw_points()
 
     def to_first(self, cam, x, y):
-        inv = cv2.invertAffineTransform(self.motion[cam])
-        return inv[:, :2] @ np.array([x, y]) + inv[:, 2]
+        return ek.to_first_frame(np.array([x, y]), self.motion[cam])
 
     def to_current(self, cam, p):
-        M = self.motion[cam]
-        return M[:, :2] @ np.asarray(p) + M[:, 2]
+        return ek.to_frame(p, self.motion[cam])
 
     def on_click(self, cam, x, y):
         want = 'a' if len(self.pts['a']) == len(self.pts['b']) else 'b'
