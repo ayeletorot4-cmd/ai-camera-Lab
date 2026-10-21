@@ -142,8 +142,9 @@ def _complete(frames, src, fps):
     return frames >= src.total_frames - max(2, fps) * len(src.paths)
 
 
-def _process_range(job):
-    """Worker: frames [start, end) of the video -> per-frame arrays (saved to a temporary .npz)."""
+def _process_range(job, stop=None):
+    """Worker: frames [start, end) of the video -> per-frame arrays (saved to a temporary .npz). stop: a
+    threading.Event that ends it early (the one-worker case runs in a thread; processes are terminated)."""
     import mediapipe as mp
     video_path, boxes, t_start, t_end, out_file, counter = job[:6]   # this part: frames with t_start <= ms < t_end
     threads = job[6] if len(job) > 6 else 0
@@ -165,6 +166,8 @@ def _process_range(job):
                                     model_complexity=1) as model:
             i = 0
             for t, frame, rgb in frames:
+                if stop is not None and stop.is_set():
+                    break
                 times.append(t)
                 if i % MOTION_EVERY == 0:
                     camera.update(frame)
@@ -218,7 +221,14 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     jobs = [(video_path, boxes, edges[k], edges[k + 1], parts[k], counter, threads) for k in range(workers)]
     t0 = time.time()
     if workers == 1:
-        th = threading.Thread(target=_process_range, args=(jobs[0],))
+        stop_thread, errors = threading.Event(), []
+
+        def run():
+            try:
+                _process_range(jobs[0], stop_thread)
+            except Exception as e:   # raised below, in the caller's thread
+                errors.append(e)
+        th = threading.Thread(target=run, daemon=True)
         th.start()
         alive = th.is_alive
         pool = None
@@ -237,6 +247,8 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
             stopped = True
             if pool is not None:
                 pool.terminate()
+            else:
+                stop_thread.set()
             break
     if pool is not None:
         if not stopped:
@@ -245,6 +257,8 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
         pool.join()
     else:
         th.join()
+        if errors and not stopped:
+            raise errors[0]
     if stopped:
         for p in parts:
             if os.path.exists(p):

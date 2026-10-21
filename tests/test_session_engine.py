@@ -163,5 +163,38 @@ class ProcessVideo(unittest.TestCase):
         self.assertEqual([f for f in os.listdir(out) if f.endswith('.npz')], [])   # no part files left
 
 
+class OneWorker(unittest.TestCase):
+    """workers=1 runs in a thread of this process: Cancel must stop it, and its error must come through."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        tex = make_texture()
+        cls.video = os.path.join(cls.dir, 'one.mp4')
+        write_video(cls.video, [synthetic_frame(i, tex) for i in range(N_FRAMES)])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_stop(self):
+        import time
+        calls = []
+        out = tempfile.mkdtemp(dir=self.dir)
+        t = time.time()
+        d = se.process_video(self.video, BOXES, out, progress=lambda n, tot, left: calls.append(n),
+                             should_stop=lambda: len(calls) >= 2, workers=1)
+        self.assertIsNone(d)
+        self.assertLess(calls[-1], N_FRAMES // 2)                 # stopped early, not after the whole video
+        self.assertLess(time.time() - t, 4)                      # not processing on in the background
+        self.assertEqual([f for f in os.listdir(out) if f.endswith('.npz')], [])
+
+    def test_error_comes_through(self):
+        from unittest import mock
+        with mock.patch.object(se, '_process_range', side_effect=ValueError('broken video')):
+            with self.assertRaisesRegex(ValueError, 'broken video'):
+                se.process_video(self.video, BOXES, tempfile.mkdtemp(dir=self.dir), workers=1)
+
+
 if __name__ == '__main__':
     unittest.main()
