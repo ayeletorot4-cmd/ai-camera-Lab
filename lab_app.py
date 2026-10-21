@@ -779,6 +779,10 @@ class LabApp(QtWidgets.QMainWindow):
             else:
                 st = (f'<span style="color:#080">processed: {c["meta"]["frames"]} frames</span>'
                       + ('' if c['meta'].get('complete') else ' <b>(stopped early - process again)</b>'))
+                gaps = [x for x in c['meta'].get('seams') or [] if x['missing']]
+                if gaps:   # where two workers' parts meet, frames are missing (see session_engine.join_parts)
+                    st += (' <span style="color:#b00">- frames missing at ' + ', '.join(
+                        f"{mmss(x['ms'])} ({x['missing']})" for x in gaps) + ': process again with LAB_WORKERS=1</span>')
             lines.append(f'<b>Camera {cam.upper()}</b> - {os.path.basename(path)}: {st}')
         self.l_proc.setText('<br>'.join(lines) or 'Choose the video(s) on the Session page first.')
 

@@ -268,15 +268,35 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     for p in parts:
         os.remove(p)
     decoders = sorted({str(c.pop('decoder')) for c in chunks})
-    d = {k: np.concatenate([c[k] for c in chunks]) for k in chunks[0]}
+    d, seams = join_parts(chunks, fps)
     d['light'], d['touch_upper'], d['touch_lower'] = d['light'].T, d['touch_upper'].T, d['touch_lower'].T
     meta = dict(video=os.path.abspath(video_path), video_size=vs.total_size(video_path), fps=fps, size=size,
                 chapters=[os.path.basename(p) for p in src.paths],
                 boxes=boxes, frames=len(d['times']), complete=_complete(len(d['times']), src, fps),
-                seconds=round(time.time() - t0, 1), workers=workers, decoder='+'.join(decoders))
+                seconds=round(time.time() - t0, 1), workers=workers, decoder='+'.join(decoders), seams=seams)
     np.savez_compressed(cache_path(video_path, out_dir), meta=json.dumps(meta), **d)
     d['meta'] = meta
     return d
+
+
+def join_parts(chunks, fps):
+    """The workers' parts -> one per-frame dict, checked where they meet: a frame the next part read again
+    (a jump by time that landed too early and a timestamp off) is dropped; a gap (> 1.5 frames) is reported.
+    Returns (data, seams): seams = [dict(ms, repeated, missing frames)] for the seams that were not clean."""
+    seams = []
+    for k in range(1, len(chunks)):
+        prev = next((c['times'] for c in reversed(chunks[:k]) if len(c['times'])), None)
+        cur = chunks[k]
+        if prev is None or not len(cur['times']):
+            continue
+        last = prev[-1]
+        repeated = int(np.sum(cur['times'] <= last + 0.25 * 1000 / fps))
+        if repeated:
+            chunks[k] = cur = {key: v[repeated:] for key, v in cur.items()}
+        gap = (cur['times'][0] - last) * fps / 1000 - 1 if len(cur['times']) else 0
+        if repeated or gap > 0.5:
+            seams.append(dict(ms=round(float(last), 1), repeated=repeated, missing=int(round(max(0, gap)))))
+    return {key: np.concatenate([c[key] for c in chunks]) for key in chunks[0]}, seams
 
 
 _counter = None

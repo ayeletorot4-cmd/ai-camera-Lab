@@ -107,6 +107,7 @@ class ProcessVideo(unittest.TestCase):
         meta = d['meta']
         self.assertEqual(meta['workers'], workers)
         self.assertTrue(meta['complete'])
+        self.assertEqual(meta['seams'], [])                  # the parts meet without repeated or missing frames
         # Every frame once, in order, at its own time (no duplicates / gaps where the parts meet)
         self.assertEqual(len(d['times']), N_FRAMES)
         np.testing.assert_allclose(d['times'], np.arange(N_FRAMES) * 1000 / FPS, atol=0.5)
@@ -161,6 +162,36 @@ class ProcessVideo(unittest.TestCase):
         self.assertEqual(calls[0][1], N_FRAMES)
         self.assertIsNone(se.load_cache(self.single, out, BOXES))
         self.assertEqual([f for f in os.listdir(out) if f.endswith('.npz')], [])   # no part files left
+
+
+class JoinParts(unittest.TestCase):
+    """Where two workers' parts meet: a frame read twice is dropped, missing frames are reported."""
+
+    def part(self, frames):
+        f = np.asarray(frames)
+        return dict(times=f * 1000 / FPS, light=np.stack([f, f], 1).astype(np.float32), pose=np.zeros((len(f), 33, 3)))
+
+    def test_clean(self):
+        d, seams = se.join_parts([self.part(range(0, 10)), self.part(range(10, 25)), self.part(range(25, 30))], FPS)
+        np.testing.assert_allclose(d['times'], np.arange(30) * 1000 / FPS)
+        self.assertEqual(seams, [])
+
+    def test_repeated_frames(self):
+        d, seams = se.join_parts([self.part(range(0, 10)), self.part(range(8, 20))], FPS)
+        np.testing.assert_allclose(d['times'], np.arange(20) * 1000 / FPS)
+        np.testing.assert_allclose(d['light'][:, 0], np.arange(20))      # all arrays cut the same way
+        self.assertEqual(d['pose'].shape[0], 20)
+        self.assertEqual(seams, [dict(ms=round(9 * 1000 / FPS, 1), repeated=2, missing=0)])
+
+    def test_missing_frames(self):
+        d, seams = se.join_parts([self.part(range(0, 10)), self.part(range(13, 20))], FPS)
+        self.assertEqual(len(d['times']), 17)
+        self.assertEqual(seams[0]['missing'], 3)
+
+    def test_empty_part(self):
+        d, seams = se.join_parts([self.part(range(0, 10)), self.part([]), self.part(range(10, 15))], FPS)
+        self.assertEqual(len(d['times']), 15)
+        self.assertEqual(seams, [])
 
 
 class OneWorker(unittest.TestCase):
