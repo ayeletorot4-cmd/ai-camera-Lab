@@ -457,11 +457,12 @@ def light_energy(frame, corners):
     x1, y1 = np.clip(np.ceil(corners.max(axis=0)).astype(int), 0, [w, h])
     if x1 - x0 < 2 or y1 - y0 < 2:
         return 0.0
-    patch = frame[y0:y1, x0:x1].astype(np.int32)
-    B, G, R = patch[..., 0], patch[..., 1], patch[..., 2]
-    excess = R - np.maximum(G, B)
-    pink = (R > 200) & (G > 90) & (B >= G - 15) & (excess > 20)
-    return float(excess[pink].sum()) * 100 / ((x1 - x0) * (y1 - y0))
+    # On the 8-bit channels (no int32 copy of the patch - this runs 5 times per 4K frame): R - max(G, B) and
+    # G - B saturate at 0, which changes nothing for the pink pixels (excess > 20, B >= G - 15 <=> G - B <= 15)
+    B, G, R = cv2.split(frame[y0:y1, x0:x1])
+    excess = cv2.subtract(R, cv2.max(G, B))
+    pink = (R > 200) & (G > 90) & (cv2.subtract(G, B) <= 15) & (excess > 20)
+    return float(excess[pink].sum(dtype=np.int64)) * 100 / ((x1 - x0) * (y1 - y0))
 
 
 def otsu_threshold(values):
