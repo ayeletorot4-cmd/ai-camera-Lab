@@ -182,9 +182,11 @@ def read_tmcd(path):
     return None
 
 
-def start_timecode(path):
-    """dict(timecode, fps, seconds, source) for the file (its first chapter, for GoPro chapters)."""
-    path = vs.first_chapter(path)
+def start_timecode(path, chapter_only=False):
+    """dict(timecode, fps, seconds, source) for the file (its first chapter, for GoPro chapters - or, with
+    chapter_only, the start of that chapter itself)."""
+    if not chapter_only:
+        path = vs.first_chapter(path)
     info = None
     try:
         info = _ffprobe(path)
@@ -231,7 +233,7 @@ def chapter_gaps(path):
     src = vs.VideoSource(path, hardware=False)
     out = []
     try:
-        starts = [start_timecode(p)['seconds'] for p in paths]
+        starts = [start_timecode(p, chapter_only=True)['seconds'] for p in paths]
     except TimecodeError:
         return []   # no timecode: only the frame counts can be summed (done in VideoSource)
     for k in range(1, len(paths)):

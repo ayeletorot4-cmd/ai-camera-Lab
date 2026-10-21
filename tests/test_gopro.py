@@ -140,6 +140,39 @@ class TimecodeFromFile(unittest.TestCase):
         self.assertAlmostEqual(s.times[-1], 35000, delta=20)  # B runs on after A stopped
 
 
+class ChapterGaps(unittest.TestCase):
+    def _clip(self, second_start_frames):
+        """Two chapters of 60 s at 60 fps; the second's timecode starts second_start_frames after the first's."""
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, 'GX010005.MP4'), os.path.join(d, 'GX020005.MP4')
+        start = tc.timecode_to_frames('10:00:00:00', 60)
+        write_tmcd_mp4(a, counter=start, timescale=60, frame_duration=1)
+        write_tmcd_mp4(b, counter=start + second_start_frames, timescale=60, frame_duration=1)
+        src = mock.Mock(info=[dict(duration_ms=60000.0, fps=60.0), dict(duration_ms=30000.0, fps=60.0)])
+        with mock.patch('shutil.which', return_value=None), mock.patch('cv2.VideoCapture') as cap, \
+                mock.patch.object(vs, 'VideoSource', return_value=src):
+            cap.return_value.get.return_value = 60.0
+            return tc.chapter_gaps(a)
+
+    def test_continuous_chapters(self):
+        self.assertEqual(self._clip(3600), [])          # chapter 2 starts right where chapter 1 ends
+
+    def test_gap(self):
+        warn = self._clip(3600 + 30)                     # half a second missing between the chapters
+        self.assertEqual(len(warn), 1)
+        self.assertIn('+500 ms', warn[0])
+
+    def test_start_timecode_of_a_later_chapter(self):
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, 'GX010006.MP4'), os.path.join(d, 'GX020006.MP4')
+        write_tmcd_mp4(a, counter=1000, timescale=60, frame_duration=1)
+        write_tmcd_mp4(b, counter=4600, timescale=60, frame_duration=1)
+        with mock.patch('shutil.which', return_value=None), mock.patch('cv2.VideoCapture') as cap:
+            cap.return_value.get.return_value = 60.0
+            self.assertEqual(tc.start_timecode(b)['seconds'], 1000 / 60)      # a clip starts at its first chapter
+            self.assertEqual(tc.start_timecode(b, chapter_only=True)['seconds'], 4600 / 60)
+
+
 class Chapters(unittest.TestCase):
     def test_detect_and_order(self):
         d = tempfile.mkdtemp()
